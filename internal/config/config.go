@@ -98,14 +98,33 @@ type Policy struct {
 }
 
 type API struct {
-	Listen            string   `json:"listen"`
-	MaxUploadSize     int64    `json:"max_upload_size"`
-	MaxConcurrent     int      `json:"max_concurrent_scans"`
-	TLSCert           string   `json:"tls_cert,omitempty"`
-	TLSKey            string   `json:"tls_key,omitempty"`
-	AutoUpdate        bool     `json:"auto_update"`
-	DBReloadInterval  Duration `json:"db_reload_interval"`
-	TrustProxyHeaders bool     `json:"trust_proxy_headers"`
+	Listen           string   `json:"listen"`
+	MaxUploadSize    int64    `json:"max_upload_size"`
+	MaxConcurrent    int      `json:"max_concurrent_scans"`
+	TLSCert          string   `json:"tls_cert,omitempty"`
+	TLSKey           string   `json:"tls_key,omitempty"`
+	AutoUpdate       bool     `json:"auto_update"`
+	DBReloadInterval Duration `json:"db_reload_interval"`
+	// TrustProxyHeaders takes the client IP from the last X-Forwarded-For
+	// entry (the one appended by your reverse proxy). Enable only behind a
+	// proxy: clients can send their own X-Forwarded-For otherwise.
+	TrustProxyHeaders bool `json:"trust_proxy_headers"`
+	// ClientIPHeader names a header set by a trusted proxy that holds the
+	// client IP, e.g. "CF-Connecting-IP" behind Cloudflare. Overrides
+	// TrustProxyHeaders. Only use it if the origin is unreachable except
+	// through that proxy.
+	ClientIPHeader string    `json:"client_ip_header,omitempty"`
+	Anonymous      Anonymous `json:"anonymous"`
+}
+
+// Anonymous allows scans without an API key (e.g. a public demo), under
+// separate, stricter limits. Requests with a valid key keep the normal limits.
+type Anonymous struct {
+	Enabled           bool  `json:"enabled"`
+	MaxUploadSize     int64 `json:"max_upload_size"`
+	RequestsPerMinute int   `json:"requests_per_minute"` // per client IP (IPv6: per /64)
+	Burst             int   `json:"burst"`
+	MaxConcurrent     int   `json:"max_concurrent_scans"` // shared by all anonymous clients
 }
 
 type Config struct {
@@ -154,6 +173,12 @@ func Default(dataDir string) *Config {
 			MaxUploadSize:    256 << 20,
 			MaxConcurrent:    8,
 			DBReloadInterval: Duration{time.Minute},
+			Anonymous: Anonymous{
+				MaxUploadSize:     10 << 20,
+				RequestsPerMinute: 10,
+				Burst:             5,
+				MaxConcurrent:     2,
+			},
 		},
 	}
 }
@@ -225,6 +250,20 @@ func (c *Config) Validate() error {
 	}
 	if c.API.MaxConcurrent <= 0 {
 		c.API.MaxConcurrent = 8
+	}
+	if a := &c.API.Anonymous; a.Enabled {
+		if a.MaxUploadSize <= 0 || a.MaxUploadSize > c.API.MaxUploadSize {
+			a.MaxUploadSize = min(10<<20, c.API.MaxUploadSize)
+		}
+		if a.RequestsPerMinute <= 0 {
+			a.RequestsPerMinute = 10
+		}
+		if a.Burst <= 0 {
+			a.Burst = 5
+		}
+		if a.MaxConcurrent <= 0 || a.MaxConcurrent > c.API.MaxConcurrent {
+			a.MaxConcurrent = min(2, c.API.MaxConcurrent)
+		}
 	}
 	if c.Limits.MaxArchiveDepth <= 0 {
 		c.Limits.MaxArchiveDepth = 6
