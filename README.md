@@ -151,6 +151,43 @@ While the database is downloading, scans get `503` with a `Retry-After` header:
 { "verdict": "retry", "reason": "signature database is not downloaded yet; an update is in progress", "retry_after_seconds": 60 }
 ```
 
+### Public demo (no API key)
+
+Anonymous access is off by default. To enable it, run `filegate serve --anonymous` or set `api.anonymous.enabled` in the config. Anonymous requests get their own stricter limits:
+
+| `api.anonymous.*` | Default | |
+|---|---|---|
+| `max_upload_size` | 10 MiB | Larger uploads get `413`, with a hint to use a key |
+| `requests_per_minute` / `burst` | 10 / 5 | Per client IP; IPv6 is grouped by /64. Over the limit you get `429` with `Retry-After`. |
+| `max_concurrent_scans` | 2 | Shared by all anonymous clients, so they can't take every scan slot |
+
+Requests with a valid API key keep the normal limits. An *invalid* key is still rejected with `401`, not treated as anonymous. `/v1/status` always requires a key.
+
+Rate limits are per client IP, so behind a reverse proxy you must tell FileGate where the real IP comes from. Otherwise every visitor shares one limit:
+
+- **Caddy or nginx on the same machine:** set `"trust_proxy_headers": true`. FileGate uses the *last* `X-Forwarded-For` entry, the one your proxy added. Earlier entries are set by the client and are ignored.
+- **Cloudflare (proxied DNS or Tunnel):** set `"client_ip_header": "CF-Connecting-IP"`. Only do this if the origin is unreachable except through Cloudflare, and keep `max_upload_size` at or below Cloudflare's 100 MB free-plan limit.
+
+A minimal deployment on a single VM (for example Oracle Cloud's Always Free ARM instance) with your own subdomain:
+
+```sh
+# DNS: an A record for scan.example.com pointing at the VM's public IP
+sudo ./scripts/install.sh --api                    # FileGate listens on 127.0.0.1:8750
+sudo filegate config show > /tmp/c.json            # edit: "api": {"trust_proxy_headers": true, "anonymous": {"enabled": true}}
+sudo cp /tmp/c.json /etc/filegate/config.json && sudo systemctl restart filegate
+sudo apt install caddy
+echo 'scan.example.com {
+  request_body { max_size 11MB }
+  reverse_proxy 127.0.0.1:8750
+}' | sudo tee /etc/caddy/Caddyfile && sudo systemctl reload caddy   # HTTPS is automatic
+```
+
+Open ports 80 and 443 in the cloud firewall (on Oracle, both the VCN security list and the instance's iptables). Then anyone can run:
+
+```sh
+curl -F file=@suspicious.pdf https://scan.example.com/v1/scan
+```
+
 ## Signature feeds
 
 | Feed | Hashes | Refresh |

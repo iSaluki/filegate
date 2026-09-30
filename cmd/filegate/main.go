@@ -506,11 +506,18 @@ func cmdServe(ctx context.Context, cfg *config.Config, args []string, stdout, st
 	fs := newFlags("serve", stderr, "serve [options]")
 	listen := fs.String("listen", cfg.API.Listen, "address to listen on")
 	autoUpdate := fs.Bool("auto-update", cfg.API.AutoUpdate, "run signature updates from within the server (not needed when the systemd timer is installed)")
+	anonymous := fs.Bool("anonymous", cfg.API.Anonymous.Enabled, "allow scans without an API key, under api.anonymous rate/size limits (e.g. a public demo)")
 	if err := fs.Parse(args); err != nil {
 		return exitError, err
 	}
 	cfg.API.Listen = *listen
 	cfg.API.AutoUpdate = *autoUpdate
+	if *anonymous && !cfg.API.Anonymous.Enabled {
+		cfg.API.Anonymous.Enabled = true
+		if err := cfg.Validate(); err != nil { // applies anonymous-limit defaults
+			return exitError, err
+		}
+	}
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
 
 	sc, err := scanner.New(cfg)
@@ -521,7 +528,7 @@ func cmdServe(ctx context.Context, cfg *config.Config, args []string, stdout, st
 	if err != nil {
 		return exitError, fmt.Errorf("loading API keys: %w", err)
 	}
-	if keys.Count() == 0 {
+	if keys.Count() == 0 && !cfg.API.Anonymous.Enabled {
 		log.Warn("no API keys configured; all authenticated requests will be rejected. Create one with 'filegate apikey create --name NAME'", "keys_file", cfg.KeysPath())
 	}
 	info := sc.Info(ctx)

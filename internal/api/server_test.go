@@ -266,3 +266,129 @@ func TestRetryWhileDatabaseDownloads(t *testing.T) {
 		t.Fatalf("scan after update = %v", m)
 	}
 }
+
+func setupAnonymous(t *testing.T, mutate func(*config.Config)) (*httptest.Server, string) {
+	t.Helper()
+	dir := t.TempDir()
+	cfg := config.Default(filepath.Join(dir, "data"))
+	cfg.SetPath(filepath.Join(dir, "config.json"))
+	cfg.ClamAV.Enabled = "off"
+	cfg.API.Anonymous.Enabled = true
+	cfg.API.Anonymous.MaxUploadSize = 1024
+	cfg.API.Anonymous.RequestsPerMinute = 60
+	cfg.API.Anonymous.Burst = 3
+	if mutate != nil {
+		mutate(cfg)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := sigdb.NewBuilder(dir)
+	b.Add(sha256.Sum256([]byte("unrelated")), "fixture")
+	os.MkdirAll(cfg.DataDir, 0o755)
+	b.Write(scanner.DBPath(cfg))
+	b.Close()
+	sc, _ := scanner.New(cfg)
+	store := apikey.NewStore(cfg.KeysPath())
+	key, _, _ := store.Create("t", 0)
+	v, _ := apikey.NewVerifier(store)
+	ts := httptest.NewServer(New(cfg, sc, v, slog.New(slog.NewTextHandler(io.Discard, nil)), "test").Handler())
+	t.Cleanup(ts.Close)
+	return ts, key
+}
+
+func post(t *testing.T, url string, body []byte, hdr map[string]string) (int, map[string]any, http.Header) {
+	t.Helper()
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var m map[string]any
+	json.NewDecoder(resp.Body).Decode(&m)
+	return resp.StatusCode, m, resp.Header
+}
+
+func TestAnonymousDisabledByDefault(t *testing.T) {
+	ts, _, _ := setup(t)
+	if code, _, _ := post(t, ts.URL+"/v1/scan", []byte("hi"), nil); code != 401 {
+		t.Fatalf("anonymous scan with anonymous disabled = %d", code)
+	}
+}
+
+func TestAnonymousAccess(t *testing.T) {
+	ts, key := setupAnonymous(t, nil)
+	// No key: allowed, and gets a real verdict.
+	code, m, _ := post(t, ts.URL+"/v1/scan?filename=e.com", eicar(), nil)
+	if code != 200 || m["verdict"] != "malicious" {
+		t.Fatalf("anonymous scan = %d %v", code, m)
+	}
+	// An invalid key is rejected, not downgraded to anonymous.
+	if code, _, _ := post(t, ts.URL+"/v1/scan", []byte("hi"), map[string]string{"X-API-Key": "fg_bogus"}); code != 401 {
+		t.Fatalf("invalid key = %d", code)
+	}
+	// Anonymous upload cap; a valid key lifts it.
+	big := bytes.Repeat([]byte("a"), 4096)
+	if code, m, _ := post(t, ts.URL+"/v1/scan", big, nil); code != 413 || !strings.Contains(m["error"].(string), "API key") {
+		t.Fatalf("anonymous oversize = %d %v", code, m)
+	}
+	if code, _, _ := post(t, ts.URL+"/v1/scan", big, map[string]string{"X-API-Key": key}); code != 200 {
+		t.Fatalf("keyed large upload = %d", code)
+	}
+	// Status stays key-only.
+	req, _ := http.NewRequest("GET", ts.URL+"/v1/status", nil)
+	if code, _ := do(t, req); code != 401 {
+		t.Fatalf("anonymous status = %d", code)
+	}
+}
+
+func TestAnonymousRateLimit(t *testing.T) {
+	ts, key := setupAnonymous(t, nil)
+	var code int
+	var hdr http.Header
+	for i := 0; i < 5; i++ { // burst is 3 (two requests above already used none)
+		code, _, hdr = post(t, ts.URL+"/v1/scan", []byte("hi"), nil)
+		if code == http.StatusTooManyRequests {
+			break
+		}
+	}
+	if code != http.StatusTooManyRequests || hdr.Get("Retry-After") == "" {
+		t.Fatalf("rate limit not enforced: %d", code)
+	}
+	// Keyed clients are not rate limited.
+	if code, _, _ := post(t, ts.URL+"/v1/scan", []byte("hi"), map[string]string{"X-API-Key": key}); code != 200 {
+		t.Fatalf("keyed scan while anonymous limited = %d", code)
+	}
+}
+
+func TestSpoofedForwardedForDoesNotEvadeLimit(t *testing.T) {
+	ts, _ := setupAnonymous(t, func(c *config.Config) { c.API.TrustProxyHeaders = true })
+	// The proxy appends the real client (here: a fixed IP) as the LAST
+	// entry; the client controls everything before it.
+	limited := false
+	for i := 0; i < 6; i++ {
+		xff := fmt.Sprintf("10.9.9.%d, 198.51.100.7", i)
+		if code, _, _ := post(t, ts.URL+"/v1/scan", []byte("hi"), map[string]string{"X-Forwarded-For": xff}); code == 429 {
+			limited = true
+			break
+		}
+	}
+	if !limited {
+		t.Fatal("rotating the client-controlled X-Forwarded-For prefix evaded the rate limit")
+	}
+}
+
+func TestClientIPHeader(t *testing.T) {
+	ts, _ := setupAnonymous(t, func(c *config.Config) { c.API.ClientIPHeader = "CF-Connecting-IP" })
+	// Distinct clients behind Cloudflare each get their own budget.
+	for i := 0; i < 6; i++ {
+		ip := fmt.Sprintf("198.51.100.%d", i)
+		if code, _, _ := post(t, ts.URL+"/v1/scan", []byte("hi"), map[string]string{"CF-Connecting-IP": ip}); code != 200 {
+			t.Fatalf("client %s = %d", ip, code)
+		}
+	}
+}

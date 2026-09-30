@@ -30,13 +30,15 @@ type Server struct {
 	keys     *apikey.Verifier
 	log      *slog.Logger
 	sem      chan struct{}
+	anonSem  chan struct{} // extra slots gating anonymous scans
+	anonRate *limiter
 	version  string
 	started  time.Time
 	updating chan struct{}
 }
 
 func New(cfg *config.Config, sc *scanner.Scanner, keys *apikey.Verifier, log *slog.Logger, version string) *Server {
-	return &Server{
+	s := &Server{
 		cfg:      cfg,
 		scanner:  sc,
 		keys:     keys,
@@ -46,6 +48,11 @@ func New(cfg *config.Config, sc *scanner.Scanner, keys *apikey.Verifier, log *sl
 		started:  time.Now(),
 		updating: make(chan struct{}, 1),
 	}
+	if a := cfg.API.Anonymous; a.Enabled {
+		s.anonSem = make(chan struct{}, a.MaxConcurrent)
+		s.anonRate = newLimiter(a.RequestsPerMinute, a.Burst)
+	}
+	return s
 }
 
 // Handler returns the routed HTTP handler.
@@ -53,24 +60,57 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	mux.Handle("GET /v1/status", s.auth(http.HandlerFunc(s.handleStatus)))
-	mux.Handle("POST /v1/scan", s.auth(http.HandlerFunc(s.handleScan)))
-	mux.Handle("GET /v1/hash/{hash}", s.auth(http.HandlerFunc(s.handleHash)))
+	mux.Handle("POST /v1/scan", s.authOrAnonymous(http.HandlerFunc(s.handleScan)))
+	mux.Handle("GET /v1/hash/{hash}", s.authOrAnonymous(http.HandlerFunc(s.handleHash)))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 	})
 	return s.logRequests(mux)
 }
 
-type ctxKey struct{}
+type (
+	ctxKey  struct{}
+	anonKey struct{}
+)
+
+func presentedKey(r *http.Request) string {
+	if k := r.Header.Get("X-API-Key"); k != "" {
+		return k
+	}
+	if h := r.Header.Get("Authorization"); len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
+		return strings.TrimSpace(h[7:])
+	}
+	return ""
+}
+
+func isAnonymous(r *http.Request) bool { return r.Context().Value(anonKey{}) != nil }
+
+// authOrAnonymous is auth, except that when anonymous access is enabled a
+// request without any key proceeds under the per-IP rate limit. A request
+// that presents an invalid key is still rejected.
+func (s *Server) authOrAnonymous(next http.Handler) http.Handler {
+	authed := s.auth(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.anonRate == nil || presentedKey(r) != "" {
+			authed.ServeHTTP(w, r)
+			return
+		}
+		if ok, wait := s.anonRate.allow(clientKey(s.remoteAddr(r))); !ok {
+			secs := int(wait.Seconds()) + 1
+			w.Header().Set("Retry-After", fmt.Sprint(secs))
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{
+				"error":               "anonymous rate limit exceeded; use an API key for higher limits",
+				"retry_after_seconds": secs,
+			})
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), anonKey{}, true)))
+	})
+}
 
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		presented := r.Header.Get("X-API-Key")
-		if presented == "" {
-			if h := r.Header.Get("Authorization"); len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
-				presented = strings.TrimSpace(h[7:])
-			}
-		}
+		presented := presentedKey(r)
 		if presented == "" {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="filegate"`)
 			writeError(w, http.StatusUnauthorized, "missing API key (use 'Authorization: Bearer <key>' or 'X-API-Key')")
@@ -118,10 +158,20 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 	})
 }
 
+// remoteAddr returns the client IP. Behind a proxy it uses the configured
+// header, or the last X-Forwarded-For entry: that is the one the proxy
+// appended, whereas earlier entries are whatever the client chose to send.
 func (s *Server) remoteAddr(r *http.Request) string {
-	if s.cfg.API.TrustProxyHeaders {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			return strings.TrimSpace(strings.Split(xff, ",")[0])
+	if h := s.cfg.API.ClientIPHeader; h != "" {
+		if v := strings.TrimSpace(r.Header.Get(h)); v != "" {
+			return v
+		}
+	} else if s.cfg.API.TrustProxyHeaders {
+		if xff := r.Header.Values("X-Forwarded-For"); len(xff) > 0 {
+			parts := strings.Split(xff[len(xff)-1], ",")
+			if v := strings.TrimSpace(parts[len(parts)-1]); v != "" {
+				return v
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -248,8 +298,7 @@ var errTooLarge = errors.New("upload too large")
 // password from either a multipart form (fields "file" and "password") or a
 // raw request body (password in the X-Archive-Password header). Passwords
 // are deliberately not accepted in the URL, which ends up in access logs.
-func (s *Server) readUpload(r *http.Request) (string, []byte, string, error) {
-	limit := s.cfg.API.MaxUploadSize
+func (s *Server) readUpload(r *http.Request, limit int64) (string, []byte, string, error) {
 	name := r.URL.Query().Get("filename")
 	password := r.Header.Get("X-Archive-Password")
 	ct, params, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -318,11 +367,20 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	if !s.gate(w, r) {
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.API.MaxUploadSize+1<<20)
-	name, data, password, err := s.readUpload(r)
+	anon := isAnonymous(r)
+	limit := s.cfg.API.MaxUploadSize
+	if anon {
+		limit = s.cfg.API.Anonymous.MaxUploadSize
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit+1<<20)
+	name, data, password, err := s.readUpload(r, limit)
 	if err != nil {
 		if errors.Is(err, errTooLarge) {
-			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload exceeds max_upload_size (%d bytes)", s.cfg.API.MaxUploadSize))
+			msg := fmt.Sprintf("upload exceeds the %d-byte limit", limit)
+			if anon {
+				msg += " for anonymous scans; use an API key for larger files"
+			}
+			writeError(w, http.StatusRequestEntityTooLarge, msg)
 			return
 		}
 		writeError(w, http.StatusBadRequest, "reading upload: "+err.Error())
@@ -337,17 +395,29 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		name = "upload"
 	}
 
-	select {
-	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
-	case <-r.Context().Done():
-		writeError(w, http.StatusServiceUnavailable, "request cancelled while waiting for a scan slot")
-		return
+	// Anonymous scans take one of their own few slots first, so they can
+	// never occupy every slot that API-key clients rely on.
+	slots := []chan struct{}{s.sem}
+	if anon {
+		slots = []chan struct{}{s.anonSem, s.sem}
+	}
+	for _, sem := range slots {
+		select {
+		case sem <- struct{}{}:
+			defer func(sem chan struct{}) { <-sem }(sem)
+		case <-r.Context().Done():
+			writeError(w, http.StatusServiceUnavailable, "request cancelled while waiting for a scan slot")
+			return
+		}
 	}
 	res := s.scanner.ScanBytesWith(r.Context(), name, data, scanner.Options{Password: password})
 	k, _ := r.Context().Value(ctxKey{}).(apikey.Key)
+	who := k.Name
+	if anon {
+		who = "anonymous"
+	}
 	s.log.Info("scan", "file", name, "size", len(data), "sha256", res.SHA256, "verdict", res.Verdict,
-		"score", res.Score, "detections", len(res.Detections), "key", k.Name, "duration_ms", res.DurationMS)
+		"score", res.Score, "detections", len(res.Detections), "key", who, "remote", s.remoteAddr(r), "duration_ms", res.DurationMS)
 	status := http.StatusOK
 	if res.Failed() {
 		// No trustworthy verdict: the body explains what could not be inspected.
@@ -371,7 +441,12 @@ func (s *Server) Run(ctx context.Context) error {
 
 	errc := make(chan error, 1)
 	go func() {
-		s.log.Info("FileGate API listening", "addr", s.cfg.API.Listen, "tls", s.cfg.API.TLSCert != "", "keys", s.keys.Count())
+		s.log.Info("FileGate API listening", "addr", s.cfg.API.Listen, "tls", s.cfg.API.TLSCert != "", "keys", s.keys.Count(),
+			"anonymous", s.cfg.API.Anonymous.Enabled)
+		if s.cfg.API.Anonymous.Enabled && !s.cfg.API.TrustProxyHeaders && s.cfg.API.ClientIPHeader == "" {
+			s.log.Warn("anonymous access is enabled without trust_proxy_headers/client_ip_header; " +
+				"behind a reverse proxy every client will share one rate limit")
+		}
 		if s.cfg.API.TLSCert != "" {
 			errc <- srv.ListenAndServeTLS(s.cfg.API.TLSCert, s.cfg.API.TLSKey)
 		} else {
@@ -392,6 +467,20 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) background(ctx context.Context) {
 	reload := time.NewTicker(max(s.cfg.API.DBReloadInterval.Duration, 5*time.Second))
 	defer reload.Stop()
+	if s.anonRate != nil {
+		prune := time.NewTicker(5 * time.Minute)
+		defer prune.Stop()
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-prune.C:
+					s.anonRate.prune()
+				}
+			}
+		}()
+	}
 	var upd <-chan time.Time
 	if s.cfg.API.AutoUpdate {
 		t := time.NewTicker(time.Minute)
