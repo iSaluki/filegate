@@ -85,7 +85,8 @@ Group={{.User}}
 ExecStart={{.Binary}} --config {{.Config}} update --quiet
 Nice=10
 IOSchedulingClass=idle
-TimeoutStartSec=30min
+# The first run downloads every feed (VirusShare alone is ~500 files).
+TimeoutStartSec=3h
 
 NoNewPrivileges=yes
 ProtectSystem=strict

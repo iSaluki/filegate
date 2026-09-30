@@ -1,11 +1,12 @@
-// Package scanner orchestrates FileGate's detection engines: the SHA-256
-// signature database, local custom signatures, the heuristic engine,
-// recursive archive unpacking and (optionally) ClamAV.
+// Package scanner orchestrates FileGate's detection engines: the hash
+// signature database (SHA-256 and MD5), local custom signatures, ClamAV,
+// the heuristic engine and recursive archive unpacking.
 package scanner
 
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +30,12 @@ import (
 const (
 	VerdictSafe      = "safe"
 	VerdictMalicious = "malicious"
+	// VerdictError means the content could not be fully inspected, so no
+	// trustworthy safe/malicious verdict can be given.
+	VerdictError = "error"
+	// VerdictRetry means the signature database is being downloaded; the
+	// caller should resend the file shortly. Produced by the CLI/API gate.
+	VerdictRetry = "retry"
 
 	EngineSignature = "signature"
 	EngineCustom    = "custom-signature"
@@ -50,8 +58,11 @@ type Result struct {
 	File           string      `json:"file"`
 	Size           int64       `json:"size"`
 	SHA256         string      `json:"sha256"`
+	MD5            string      `json:"md5,omitempty"`
 	Type           string      `json:"type"`
 	Verdict        string      `json:"verdict"`
+	Error          string      `json:"error,omitempty"`
+	Unscannable    []Issue     `json:"unscannable,omitempty"`
 	Score          int         `json:"score"`
 	Detections     []Detection `json:"detections"`
 	ObjectsScanned int         `json:"objects_scanned"`
@@ -60,21 +71,53 @@ type Result struct {
 	DurationMS     float64     `json:"duration_ms"`
 }
 
+// Issue records content that could not be inspected.
+type Issue struct {
+	Object string `json:"object,omitempty"`
+	Reason string `json:"reason"`
+}
+
+// Options are per-scan settings.
+type Options struct {
+	// Password decrypts password-protected archives. FileGate never guesses.
+	Password string
+}
+
 // Malicious reports whether the verdict is malicious.
 func (r *Result) Malicious() bool { return r.Verdict == VerdictMalicious }
+
+// Failed reports whether the scan could not produce a trustworthy verdict.
+func (r *Result) Failed() bool { return r.Verdict == VerdictError }
+
+// ErrNoSignatures is returned by Ready when no signature database is loaded.
+var ErrNoSignatures = errors.New("signature database not loaded; run 'filegate update' (or 'sudo filegate update')")
+
+// ClamAVError explains why the required ClamAV engine is unusable.
+type ClamAVError struct {
+	Reason       string
+	Instructions string
+}
+
+func (e *ClamAVError) Error() string {
+	if e.Instructions == "" {
+		return "ClamAV is required: " + e.Reason
+	}
+	return "ClamAV is required: " + e.Reason + "\n" + e.Instructions
+}
 
 // Scanner is safe for concurrent use.
 type Scanner struct {
 	cfg    *config.Config
-	db     atomic.Pointer[sigdb.DB]
+	db     atomic.Pointer[sigdb.Set]
 	custom atomic.Pointer[sigdb.LocalList]
 	allow  atomic.Pointer[sigdb.LocalList]
-	clam   *clamav.Client
+	clam   atomic.Pointer[clamav.Client]
 	mu     sync.Mutex // serialises reloads
 }
 
 // Paths within the data directory.
 func DBPath(cfg *config.Config) string       { return filepath.Join(cfg.DataDir, "hashes.fgdb") }
+func DeltaPath(cfg *config.Config) string    { return filepath.Join(cfg.DataDir, "hashes-delta.fgdb") }
 func CustomSigDir(cfg *config.Config) string { return filepath.Join(cfg.DataDir, "signatures") }
 func AllowlistDir(cfg *config.Config) string { return filepath.Join(cfg.DataDir, "allowlist") }
 func UpdateStatePath(cfg *config.Config) string {
@@ -82,28 +125,70 @@ func UpdateStatePath(cfg *config.Config) string {
 }
 
 // New creates a scanner and loads its databases. A missing signature
-// database is not an error (heuristics still work) but is reported by Info.
+// database is not an error here; Ready reports it.
 func New(cfg *config.Config) (*Scanner, error) {
 	s := &Scanner{cfg: cfg}
 	if err := s.Reload(); err != nil {
 		return nil, err
 	}
-	switch cfg.ClamAV.Enabled {
-	case "on", "auto", "":
-		s.clam = clamav.New(cfg.ClamAV.Socket, cfg.ClamAV.Timeout.Duration)
-	}
+	s.clamClient()
 	return s, nil
+}
+
+func (s *Scanner) clamRequired() bool {
+	return s.cfg.ClamAV.Enabled == "required" || s.cfg.ClamAV.Enabled == "on" || s.cfg.ClamAV.Enabled == ""
+}
+
+// clamClient returns the clamd client, detecting the socket lazily so a
+// clamd installed after FileGate started is picked up without a restart.
+func (s *Scanner) clamClient() *clamav.Client {
+	if s.cfg.ClamAV.Enabled == "off" {
+		return nil
+	}
+	if c := s.clam.Load(); c != nil {
+		return c
+	}
+	c := clamav.New(s.cfg.ClamAV.Socket, s.cfg.ClamAV.Timeout.Duration)
+	if c != nil {
+		s.clam.Store(c)
+	}
+	return c
+}
+
+// ClamAVReady checks that the required ClamAV engine is reachable.
+func (s *Scanner) ClamAVReady(ctx context.Context) error {
+	if !s.clamRequired() {
+		return nil
+	}
+	c := s.clamClient()
+	if c == nil {
+		return &ClamAVError{Reason: "no clamd socket found", Instructions: clamav.InstallInstructions()}
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := c.Ping(ctx); err != nil {
+		return clamUnreachable(c, err)
+	}
+	return nil
+}
+
+func clamUnreachable(c *clamav.Client, err error) error {
+	reason := fmt.Sprintf("clamd at %s is not responding (%v)", c.Addr(), err)
+	if errors.Is(err, os.ErrPermission) || strings.Contains(err.Error(), "permission denied") {
+		return &ClamAVError{Reason: fmt.Sprintf("permission denied connecting to clamd at %s; add this user to the clamd socket's group", c.Addr())}
+	}
+	return &ClamAVError{Reason: reason, Instructions: clamav.InstallInstructions()}
 }
 
 // Reload (re)loads the signature database and local lists from disk.
 func (s *Scanner) Reload() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	db, err := sigdb.Open(DBPath(s.cfg))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	set, err := sigdb.OpenSet(DBPath(s.cfg), DeltaPath(s.cfg))
+	if err != nil {
 		return fmt.Errorf("loading signature database: %w", err)
 	}
-	if old := s.db.Swap(db); old != nil {
+	if old := s.db.Swap(set); old != nil {
 		// Give in-flight lookups time to finish before unmapping.
 		time.AfterFunc(2*time.Minute, old.Close)
 	}
@@ -120,16 +205,27 @@ func (s *Scanner) Reload() error {
 	return nil
 }
 
-// ReloadIfChanged reloads when the database file on disk has changed.
-func (s *Scanner) ReloadIfChanged() (bool, error) {
-	fi, err := os.Stat(DBPath(s.cfg))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-		return false, err
+// SignatureCount returns the number of loaded feed hashes.
+func (s *Scanner) SignatureCount() int { return s.db.Load().Count() }
+
+// Ready reports whether a signature database is loaded.
+func (s *Scanner) Ready() error {
+	if s.cfg.Policy.RequireSignatures && s.SignatureCount() == 0 {
+		return ErrNoSignatures
 	}
-	if cur := s.db.Load(); cur != nil && cur.ModTime().Equal(fi.ModTime()) {
+	return nil
+}
+
+// ReloadIfChanged reloads when a database file on disk has changed.
+func (s *Scanner) ReloadIfChanged() (bool, error) {
+	var disk [2]time.Time
+	for i, p := range []string{DBPath(s.cfg), DeltaPath(s.cfg)} {
+		if fi, err := os.Stat(p); err == nil {
+			disk[i] = fi.ModTime()
+		}
+	}
+	cur := s.db.Load().ModTimes()
+	if cur[0].Equal(disk[0]) && cur[1].Equal(disk[1]) {
 		return false, nil
 	}
 	return true, s.Reload()
@@ -148,26 +244,25 @@ type Info struct {
 }
 
 func (s *Scanner) Info(ctx context.Context) Info {
-	db := s.db.Load()
+	set := s.db.Load()
 	in := Info{
-		SignatureCount:   db.Count(),
+		SignatureCount:   set.Count(),
+		SignatureSources: set.Sources(),
+		SignatureDBDate:  set.Created(),
 		CustomSignatures: s.custom.Load().Len(),
 		Allowlisted:      s.allow.Load().Len(),
 		Heuristics:       s.cfg.Heuristics.Enabled,
 		ClamAV:           "disabled",
 	}
-	if db != nil {
-		in.SignatureSources = db.Sources
-		in.SignatureDBDate = db.Created
-	}
-	if s.clam != nil {
+	if c := s.clamClient(); c != nil {
 		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
-		if v, err := s.clam.Version(ctx); err == nil {
-			in.ClamAV = s.clam.Addr()
-			in.ClamAVVersion = v
+		if v, err := c.Version(ctx); err == nil {
+			in.ClamAV, in.ClamAVVersion = c.Addr(), v
+		} else if c.Ping(ctx) == nil {
+			in.ClamAV = c.Addr() // reachable; this clamd does not report its version
 		} else {
-			in.ClamAV = "unreachable (" + s.clam.Addr() + ")"
+			in.ClamAV = "unreachable (" + c.Addr() + ")"
 		}
 	} else if s.cfg.ClamAV.Enabled != "off" {
 		in.ClamAV = "not found"
@@ -175,75 +270,134 @@ func (s *Scanner) Info(ctx context.Context) Info {
 	return in
 }
 
-// LookupHash checks a SHA-256 against all signature sources.
-func (s *Scanner) LookupHash(h sigdb.Hash) (Detection, bool, bool) {
-	if _, ok := s.allow.Load().Lookup(h); ok {
+// LookupHash checks an object's hashes against all signature sources. The
+// allowlist only honours SHA-256: MD5 collisions are practical, so an MD5
+// allowlist entry could be abused to whitelist crafted malware.
+func (s *Scanner) LookupHash(h256 sigdb.Hash, hmd5 *sigdb.HashMD5) (Detection, bool, bool) {
+	if _, ok := s.allow.Load().Lookup(h256); ok {
 		return Detection{}, false, true
 	}
-	if name, ok := s.custom.Load().Lookup(h); ok {
+	custom := s.custom.Load()
+	if name, ok := custom.Lookup(h256); ok {
 		return Detection{Engine: EngineCustom, Name: name, Score: 100, Description: "matches a local custom signature"}, true, false
 	}
-	if src, ok := s.db.Load().Lookup(h); ok {
-		return Detection{Engine: EngineSignature, Name: "Malware.SHA256." + src, Score: 100, Description: "file hash matches known malware (" + src + ")"}, true, false
+	set := s.db.Load()
+	if src, ok := set.Lookup(h256); ok {
+		return Detection{Engine: EngineSignature, Name: "Malware.SHA256." + src, Score: 100, Description: "SHA-256 matches known malware (" + src + ")"}, true, false
+	}
+	if hmd5 != nil {
+		if name, ok := custom.LookupMD5(*hmd5); ok {
+			return Detection{Engine: EngineCustom, Name: name, Score: 100, Description: "matches a local custom signature (MD5)"}, true, false
+		}
+		if src, ok := set.LookupMD5(*hmd5); ok {
+			return Detection{Engine: EngineSignature, Name: "Malware.MD5." + src, Score: 100, Description: "MD5 matches known malware (" + src + ")"}, true, false
+		}
 	}
 	return Detection{}, false, false
 }
 
 type scanState struct {
-	budget     archive.Budget
-	detections []Detection
-	warnings   []string
-	objects    int
-	maxScore   int
-	allowTop   bool
+	budget      archive.Budget
+	detections  []Detection
+	warnings    []string
+	objects     int
+	maxScore    int
+	allowTop    bool
+	unscannable []Issue
+	clamOK      func() bool // whether ClamAV successfully scanned the top-level file
+	opts        Options
+}
+
+func (st *scanState) cannotScan(obj, reason string) {
+	st.unscannable = append(st.unscannable, Issue{Object: obj, Reason: reason})
+}
+
+// clamScan runs ClamAV on r. It returns a detection, or an error message
+// describing why ClamAV could not scan (empty on success).
+func (s *Scanner) clamScan(ctx context.Context, obj string, r io.Reader) (*Detection, string) {
+	c := s.clamClient()
+	if c == nil {
+		if s.clamRequired() {
+			return nil, (&ClamAVError{Reason: "no clamd socket found", Instructions: clamav.InstallInstructions()}).Error()
+		}
+		return nil, ""
+	}
+	sig, found, err := c.Scan(ctx, r)
+	switch {
+	case errors.Is(err, clamav.ErrSizeLimit):
+		return nil, "ClamAV rejected the file as too large; raise StreamMaxLength in clamd.conf (and MaxFileSize/MaxScanSize) above limits.max_file_size"
+	case err != nil:
+		return nil, clamUnreachable(c, err).Error()
+	case found && strings.HasPrefix(sig, "Heuristics.Limits.Exceeded"):
+		// AlertExceedsMax: ClamAV skipped part of the file due to its limits.
+		return nil, "ClamAV could not scan all content (" + sig + "); raise MaxFileSize/MaxScanSize/MaxRecursion in clamd.conf"
+	case found && strings.HasPrefix(sig, "Heuristics.Encrypted"):
+		return nil, "ClamAV found encrypted content it cannot inspect (" + sig + ")"
+	case found:
+		return &Detection{Engine: EngineClamAV, Name: sig, Object: obj, Score: 100, Description: "ClamAV signature match"}, ""
+	}
+	return nil, ""
+}
+
+// handleClam records a ClamAV outcome for object obj.
+func (s *Scanner) handleClam(st *scanState, obj string, det *Detection, errMsg string) {
+	if det != nil {
+		st.detections = append(st.detections, *det)
+		st.maxScore = max(st.maxScore, det.Score)
+	}
+	if errMsg == "" {
+		return
+	}
+	if s.clamRequired() {
+		st.cannotScan(obj, errMsg)
+	} else {
+		st.warnings = append(st.warnings, obj+": clamav: "+errMsg)
+	}
 }
 
 // ScanBytes scans in-memory content. name is used for display and for
 // filename-based heuristics.
 func (s *Scanner) ScanBytes(ctx context.Context, name string, data []byte) *Result {
+	return s.ScanBytesWith(ctx, name, data, Options{})
+}
+
+// ScanBytesWith scans in-memory content with per-scan options.
+func (s *Scanner) ScanBytesWith(ctx context.Context, name string, data []byte, opts Options) *Result {
 	start := time.Now()
 	sum := sha256.Sum256(data)
+	msum := md5.Sum(data)
 	res := &Result{
 		File:   name,
 		Size:   int64(len(data)),
 		SHA256: hex.EncodeToString(sum[:]),
+		MD5:    hex.EncodeToString(msum[:]),
 		Type:   string(heuristics.Detect(data)),
 	}
-	st := &scanState{budget: archive.Budget{Bytes: s.cfg.Limits.MaxTotalExtract, Files: s.cfg.Limits.MaxArchiveFiles}}
+	st := &scanState{budget: archive.Budget{Bytes: s.cfg.Limits.MaxTotalExtract, Files: s.cfg.Limits.MaxArchiveFiles}, opts: opts}
+	top := filepath.Base(name)
 
+	// ClamAV scans the whole file (recursing into archives itself) in
+	// parallel with FileGate's own engines.
 	var wg sync.WaitGroup
 	var clamDet *Detection
-	var clamWarn string
-	if s.clam != nil {
+	var clamErr string
+	active := s.cfg.ClamAV.Enabled != "off"
+	if active {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			clamDet, clamWarn = s.clamScan(ctx, name, bytes.NewReader(data))
+			clamDet, clamErr = s.clamScan(ctx, top, bytes.NewReader(data))
 		}()
 	}
+	st.clamOK = func() bool { wg.Wait(); return active && s.clamClient() != nil && clamErr == "" }
 
-	s.scanObject(ctx, st, filepath.Base(name), "", data, sum, 0)
+	s.scanObject(ctx, st, top, "", data, sum, msum, 0, false, nil)
 	wg.Wait()
-	if clamDet != nil && !st.allowTop {
-		st.detections = append(st.detections, *clamDet)
-		st.maxScore = max(st.maxScore, clamDet.Score)
-	}
-	if clamWarn != "" {
-		st.warnings = append(st.warnings, clamWarn)
+	if !st.allowTop && active {
+		s.handleClam(st, top, clamDet, clamErr)
 	}
 	s.finish(res, st, start)
 	return res
-}
-
-func (s *Scanner) clamScan(ctx context.Context, name string, r io.Reader) (*Detection, string) {
-	sig, found, err := s.clam.Scan(ctx, r)
-	if err != nil {
-		return nil, "clamav: " + err.Error()
-	}
-	if !found {
-		return nil, ""
-	}
-	return &Detection{Engine: EngineClamAV, Name: sig, Object: filepath.Base(name), Score: 100, Description: "ClamAV signature match"}, ""
 }
 
 func (s *Scanner) finish(res *Result, st *scanState, start time.Time) {
@@ -256,25 +410,50 @@ func (s *Scanner) finish(res *Result, st *scanState, start time.Time) {
 	res.ObjectsScanned = st.objects
 	res.Score = st.maxScore
 	res.Allowlisted = st.allowTop
-	res.Verdict = VerdictSafe
-	if st.maxScore >= s.cfg.Heuristics.Threshold {
+	if err := s.Ready(); err != nil && !st.allowTop {
+		st.unscannable = append([]Issue{{Reason: err.Error()}}, st.unscannable...)
+	}
+	res.Unscannable = st.unscannable
+	switch {
+	case st.maxScore >= s.cfg.Heuristics.Threshold:
+		// A positive detection is conclusive even if other parts were unscannable.
 		res.Verdict = VerdictMalicious
+	case st.allowTop:
+		res.Verdict = VerdictSafe
+	case len(st.unscannable) > 0 && s.cfg.Policy.Unscannable == "malicious":
+		res.Verdict = VerdictMalicious
+	case len(st.unscannable) > 0:
+		res.Verdict = VerdictError
+		// The first reason is the headline; every issue is listed in Unscannable.
+		res.Error = st.unscannable[0].Reason
+	default:
+		res.Verdict = VerdictSafe
 	}
 	res.DurationMS = float64(time.Since(start).Microseconds()) / 1000
 }
 
-func (s *Scanner) scanObject(ctx context.Context, st *scanState, name, parent string, data []byte, sum [32]byte, depth int) {
+// scanObject analyses one object. clamThis requests a direct ClamAV scan
+// (for content ClamAV cannot reach via the top-level file, such as members
+// FileGate decrypted). clamCovered, when non-nil, says whether an ancestor's
+// direct ClamAV scan succeeded; nil means coverage comes from the top-level scan.
+func (s *Scanner) scanObject(ctx context.Context, st *scanState, name, parent string, data []byte, sum [32]byte, msum [16]byte, depth int, clamThis bool, clamCovered *bool) {
 	objPath := name
 	if parent != "" {
 		objPath = parent + "!" + name
 	}
 	if err := ctx.Err(); err != nil {
-		st.warnings = append(st.warnings, objPath+": scan aborted: "+err.Error())
+		st.cannotScan(objPath, "scan aborted: "+err.Error())
 		return
 	}
 	st.objects++
 
-	det, hit, allowed := s.LookupHash(sum)
+	// An empty object cannot be malicious, and the empty-file hash appears in
+	// several feeds (malware URLs sometimes serve empty responses).
+	var det Detection
+	var hit, allowed bool
+	if len(data) > 0 {
+		det, hit, allowed = s.LookupHash(sum, &msum)
+	}
 	if allowed {
 		if depth == 0 {
 			st.allowTop = true
@@ -300,7 +479,33 @@ func (s *Scanner) scanObject(ctx context.Context, st *scanState, name, parent st
 		return // known malware: no need to analyse further
 	}
 
+	// Content ClamAV cannot reach through the top-level file (e.g. members
+	// FileGate decrypted with a known password) is sent to ClamAV directly.
+	if clamThis {
+		ok := false
+		if s.cfg.ClamAV.Enabled != "off" {
+			d, e := s.clamScan(ctx, objPath, bytes.NewReader(data))
+			if d != nil {
+				add(*d)
+			}
+			if e != "" {
+				s.handleClam(st, objPath, nil, e)
+			}
+			ok = e == "" && s.clamClient() != nil
+		}
+		clamCovered = &ok
+	}
+	covered := func() bool {
+		if clamCovered != nil {
+			return *clamCovered
+		}
+		return st.clamOK != nil && st.clamOK()
+	}
+
 	ft := heuristics.Detect(data)
+	if heuristics.IsEncryptedOffice(data) {
+		st.cannotScan(objPath, "password-protected Office document; content cannot be inspected")
+	}
 	var children []heuristics.Child
 	if s.cfg.Heuristics.Enabled {
 		var fs []heuristics.Finding
@@ -310,11 +515,11 @@ func (s *Scanner) scanObject(ctx context.Context, st *scanState, name, parent st
 		}
 	}
 
-	recurse := func(childName string, childData []byte) error {
+	recurse := func(childName string, childData []byte, decrypted bool) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		s.scanObject(ctx, st, childName, objPath, childData, sha256.Sum256(childData), depth+1)
+		s.scanObject(ctx, st, childName, objPath, childData, sha256.Sum256(childData), md5.Sum(childData), depth+1, decrypted, clamCovered)
 		return nil
 	}
 
@@ -322,14 +527,15 @@ func (s *Scanner) scanObject(ctx context.Context, st *scanState, name, parent st
 		if depth >= s.cfg.Limits.MaxArchiveDepth {
 			add(Detection{Engine: EngineArchive, Name: "Heuristic.Archive.TooDeep", Score: 50,
 				Description: fmt.Sprintf("archive nesting exceeds %d levels (possible recursive bomb)", s.cfg.Limits.MaxArchiveDepth)})
+			st.cannotScan(objPath, fmt.Sprintf("nested deeper than max_archive_depth (%d)", s.cfg.Limits.MaxArchiveDepth))
 			return
 		}
 	}
 	if ft.IsArchive() {
 		r := archive.Extract(ft, name, data, &st.budget, archive.Options{
-			MaxEntrySize:              s.cfg.Limits.MaxFileSize,
-			MaxCompressRatio:          s.cfg.Limits.MaxCompressRatio,
-			BlockEncryptedExecutables: s.cfg.Heuristics.BlockEncryptedExecutables,
+			MaxEntrySize:     s.cfg.Limits.MaxFileSize,
+			MaxCompressRatio: s.cfg.Limits.MaxCompressRatio,
+			Password:         st.opts.Password,
 		}, recurse)
 		for _, f := range r.Findings {
 			add(Detection{Engine: EngineArchive, Name: f.Name, Score: f.Score, Description: f.Description})
@@ -337,20 +543,31 @@ func (s *Scanner) scanObject(ctx context.Context, st *scanState, name, parent st
 		for _, w := range r.Warnings {
 			st.warnings = append(st.warnings, objPath+": "+w)
 		}
-	} else if s.clam == nil {
+		for _, u := range r.Unscannable {
+			st.cannotScan(objPath, u)
+		}
+	} else {
 		switch ft {
 		case heuristics.Type7z, heuristics.TypeRAR, heuristics.TypeCAB, heuristics.TypeISO:
-			st.warnings = append(st.warnings, fmt.Sprintf("%s: %s container not unpacked (enable ClamAV for full coverage)", objPath, ft))
+			// Only ClamAV unpacks these (it recurses into archives itself).
+			if !covered() {
+				st.cannotScan(objPath, fmt.Sprintf("%s containers can only be inspected with ClamAV, which did not scan it", ft))
+			}
 		}
 	}
 	for _, c := range children {
-		_ = recurse(c.Name, c.Data)
+		_ = recurse(c.Name, c.Data, false)
 	}
 }
 
 // ScanFile scans a file on disk. Files larger than limits.max_file_size are
-// hash-checked and sent to ClamAV (if available) but not analysed in memory.
+// hash-checked and streamed to ClamAV but not analysed in memory.
 func (s *Scanner) ScanFile(ctx context.Context, path string) (*Result, error) {
+	return s.ScanFileWith(ctx, path, Options{})
+}
+
+// ScanFileWith scans a file on disk with per-scan options.
+func (s *Scanner) ScanFileWith(ctx context.Context, path string, opts Options) (*Result, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -368,45 +585,55 @@ func (s *Scanner) ScanFile(ctx context.Context, path string) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		r := s.ScanBytes(ctx, path, data)
-		return r, nil
+		return s.ScanBytesWith(ctx, path, data, opts), nil
 	}
 	return s.scanLarge(ctx, path, f, fi.Size())
 }
 
 func (s *Scanner) scanLarge(ctx context.Context, path string, f *os.File, size int64) (*Result, error) {
 	start := time.Now()
-	h := sha256.New()
+	h, hm := sha256.New(), md5.New()
 	head := make([]byte, 64*1024)
 	n, _ := io.ReadFull(f, head)
 	head = head[:n]
-	h.Write(head)
-	if _, err := io.Copy(h, f); err != nil {
+	w := io.MultiWriter(h, hm)
+	w.Write(head)
+	if _, err := io.Copy(w, f); err != nil {
 		return nil, err
 	}
 	var sum [32]byte
+	var msum [16]byte
 	copy(sum[:], h.Sum(nil))
-	res := &Result{File: path, Size: size, SHA256: hex.EncodeToString(sum[:]), Type: string(heuristics.Detect(head))}
-	st := &scanState{}
-	st.objects = 1
-	st.warnings = append(st.warnings, fmt.Sprintf("file exceeds max_file_size (%d bytes); content analysis limited to hash lookup and ClamAV", s.cfg.Limits.MaxFileSize))
-	det, hit, allowed := s.LookupHash(sum)
+	copy(msum[:], hm.Sum(nil))
+	res := &Result{File: path, Size: size, SHA256: hex.EncodeToString(sum[:]), MD5: hex.EncodeToString(msum[:]), Type: string(heuristics.Detect(head))}
+	st := &scanState{objects: 1}
+	obj := filepath.Base(path)
+	det, hit, allowed := s.LookupHash(sum, &msum)
 	st.allowTop = allowed
 	if hit {
-		det.Object = filepath.Base(path)
+		det.Object = obj
 		st.detections = append(st.detections, det)
 		st.maxScore = det.Score
 	}
-	if !hit && !allowed && s.clam != nil {
-		if _, err := f.Seek(0, io.SeekStart); err == nil {
-			d, w := s.clamScan(ctx, path, f)
-			if d != nil {
-				st.detections = append(st.detections, *d)
-				st.maxScore = max(st.maxScore, d.Score)
+	if !hit && !allowed {
+		// Too large to analyse in memory: ClamAV is the only content engine.
+		clamErr := "ClamAV is disabled"
+		var d *Detection
+		if s.cfg.ClamAV.Enabled != "off" {
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				return nil, err
 			}
-			if w != "" {
-				st.warnings = append(st.warnings, w)
+			d, clamErr = s.clamScan(ctx, obj, f)
+			if clamErr == "" && s.clamClient() == nil {
+				clamErr = "ClamAV is not available"
 			}
+		}
+		if d != nil {
+			st.detections = append(st.detections, *d)
+			st.maxScore = max(st.maxScore, d.Score)
+		}
+		if clamErr != "" {
+			st.cannotScan(obj, fmt.Sprintf("file exceeds max_file_size (%d bytes) so only ClamAV can inspect it, but: %s", s.cfg.Limits.MaxFileSize, clamErr))
 		}
 	}
 	s.finish(res, st, start)

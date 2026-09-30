@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -42,10 +43,16 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 
 // Feed describes a downloadable list of malicious SHA-256 hashes.
 type Feed struct {
-	Name    string `json:"name"`
-	URL     string `json:"url"`
-	Format  string `json:"format"`  // "text" (one hash per line) or "zip" (zip containing text files)
-	Refresh string `json:"refresh"` // "full" (only on full rebuilds) or "incremental" (every update)
+	Name string `json:"name"`
+	URL  string `json:"url"`
+	// Format: "text" (one hash per line, or CSV) or "zip" (zip of such files).
+	// Each line contributes its first SHA-256, or else its first MD5.
+	Format string `json:"format"`
+	// Refresh: "full" (re-downloaded on full rebuilds, replacing its old
+	// entries), "incremental" (fetched every update, entries accumulate) or
+	// "append" (sharded, append-only list: URL contains a printf verb such as
+	// %05d; only shards not yet fetched are downloaded).
+	Refresh string `json:"refresh"`
 	// Optional HTTP header to send (e.g. abuse.ch "Auth-Key").
 	HeaderName  string `json:"header_name,omitempty"`
 	HeaderValue string `json:"header_value,omitempty"`
@@ -53,7 +60,8 @@ type Feed struct {
 }
 
 type ClamAV struct {
-	// Enabled: "auto" (use clamd if a socket is found), "on", or "off".
+	// Enabled: "required" (default; scans return an error if clamd is
+	// unavailable), "auto" (use clamd if found), or "off".
 	Enabled string `json:"enabled"`
 	// Socket is a unix socket path or tcp address (tcp://host:port). Empty = auto-detect.
 	Socket  string   `json:"socket"`
@@ -74,8 +82,19 @@ type Heuristics struct {
 	Enabled bool `json:"enabled"`
 	// Threshold is the per-object score at or above which the verdict is malicious.
 	Threshold int `json:"threshold"`
-	// BlockEncryptedExecutables flags password-protected archives containing executables/scripts.
-	BlockEncryptedExecutables bool `json:"block_encrypted_executables"`
+}
+
+type Policy struct {
+	// Unscannable decides the verdict when content could not be fully
+	// inspected and nothing malicious was found: "error" (default) returns
+	// an error instead of a verdict; "malicious" fails closed.
+	Unscannable string `json:"unscannable"`
+	// RequireSignatures makes scans fail with an error when no signature
+	// database is loaded, instead of silently relying on heuristics.
+	RequireSignatures bool `json:"require_signatures"`
+	// MaxSignatureAge: when no update has succeeded for this long, scans
+	// trigger an update and answer "retry". 0 disables the check.
+	MaxSignatureAge Duration `json:"max_signature_age"`
 }
 
 type API struct {
@@ -97,7 +116,9 @@ type Config struct {
 	ClamAV              ClamAV     `json:"clamav"`
 	Limits              Limits     `json:"limits"`
 	Heuristics          Heuristics `json:"heuristics"`
-	API                 API        `json:"api"`
+	Policy              Policy     `json:"policy"`
+
+	API API `json:"api"`
 
 	path string // where the config was loaded from
 }
@@ -109,22 +130,16 @@ func Default(dataDir string) *Config {
 		UpdateInterval:      Duration{time.Hour},
 		FullRefreshInterval: Duration{7 * 24 * time.Hour},
 		Feeds: []Feed{
-			{
-				Name:    "malwarebazaar-full",
-				URL:     "https://bazaar.abuse.ch/export/txt/sha256/full/",
-				Format:  "zip",
-				Refresh: "full",
-				Enabled: true,
-			},
-			{
-				Name:    "malwarebazaar-recent",
-				URL:     "https://bazaar.abuse.ch/export/txt/sha256/recent/",
-				Format:  "text",
-				Refresh: "incremental",
-				Enabled: true,
-			},
+			{Name: "malwarebazaar-full", URL: "https://bazaar.abuse.ch/export/txt/sha256/full/", Format: "zip", Refresh: "full", Enabled: true},
+			{Name: "malwarebazaar-recent", URL: "https://bazaar.abuse.ch/export/txt/sha256/recent/", Format: "text", Refresh: "incremental", Enabled: true},
+			{Name: "threatfox-full", URL: "https://threatfox.abuse.ch/export/csv/sha256/full/", Format: "zip", Refresh: "full", Enabled: true},
+			{Name: "threatfox-recent", URL: "https://threatfox.abuse.ch/export/csv/sha256/recent/", Format: "text", Refresh: "incremental", Enabled: true},
+			{Name: "urlhaus-payloads", URL: "https://urlhaus.abuse.ch/downloads/payloads/", Format: "zip", Refresh: "full", Enabled: true},
+			// VirusShare (~33M MD5s) is opt-in: it indexes whatever is submitted,
+			// including benign files, and matched ordinary OS files in testing.
+			{Name: "virusshare", URL: "https://virusshare.com/hashfiles/VirusShare_%05d.md5", Format: "text", Refresh: "append", Enabled: false},
 		},
-		ClamAV: ClamAV{Enabled: "auto", Timeout: Duration{60 * time.Second}},
+		ClamAV: ClamAV{Enabled: "required", Timeout: Duration{60 * time.Second}},
 		Limits: Limits{
 			MaxFileSize:      256 << 20,
 			MaxTotalExtract:  1 << 30,
@@ -132,7 +147,8 @@ func Default(dataDir string) *Config {
 			MaxArchiveFiles:  20000,
 			MaxCompressRatio: 100,
 		},
-		Heuristics: Heuristics{Enabled: true, Threshold: 100, BlockEncryptedExecutables: true},
+		Heuristics: Heuristics{Enabled: true, Threshold: 100},
+		Policy:     Policy{Unscannable: "error", RequireSignatures: true, MaxSignatureAge: Duration{24 * time.Hour}},
 		API: API{
 			Listen:           "127.0.0.1:8750",
 			MaxUploadSize:    256 << 20,
@@ -155,10 +171,19 @@ func ResolvePath(explicit string) string {
 	if _, err := os.Stat(sys); !errors.Is(err, os.ErrNotExist) || os.Geteuid() == 0 {
 		return sys
 	}
+	user := ""
 	if dir, err := os.UserConfigDir(); err == nil {
-		return filepath.Join(dir, "filegate", ConfigFileName)
+		user = filepath.Join(dir, "filegate", ConfigFileName)
+		if _, err := os.Stat(user); err == nil {
+			return user
+		}
 	}
-	return sys
+	// No personal config: share the system database (e.g. populated by
+	// `sudo filegate update`) rather than silently using an empty one.
+	if _, err := os.Stat(SystemDataDir); err == nil || user == "" {
+		return sys
+	}
+	return user
 }
 
 func defaultDataDirFor(cfgPath string) string {
@@ -207,12 +232,34 @@ func (c *Config) Validate() error {
 	if c.Limits.MaxCompressRatio <= 0 {
 		c.Limits.MaxCompressRatio = 100
 	}
+	switch c.ClamAV.Enabled {
+	case "":
+		c.ClamAV.Enabled = "required"
+	case "on":
+		c.ClamAV.Enabled = "required"
+	case "required", "auto", "off":
+	default:
+		return fmt.Errorf("clamav.enabled must be \"required\", \"auto\" or \"off\"")
+	}
+	switch c.Policy.Unscannable {
+	case "":
+		c.Policy.Unscannable = "error"
+	case "error", "malicious":
+	default:
+		return fmt.Errorf("policy.unscannable must be \"error\" or \"malicious\"")
+	}
 	for _, f := range c.Feeds {
 		if f.Format != "text" && f.Format != "zip" {
 			return fmt.Errorf("feed %q: format must be \"text\" or \"zip\"", f.Name)
 		}
-		if f.Refresh != "full" && f.Refresh != "incremental" {
-			return fmt.Errorf("feed %q: refresh must be \"full\" or \"incremental\"", f.Name)
+		switch f.Refresh {
+		case "full", "incremental":
+		case "append":
+			if !strings.Contains(f.URL, "%") {
+				return fmt.Errorf("feed %q: append feeds need a shard number verb (e.g. %%05d) in the URL", f.Name)
+			}
+		default:
+			return fmt.Errorf("feed %q: refresh must be \"full\", \"incremental\" or \"append\"", f.Name)
 		}
 	}
 	return nil

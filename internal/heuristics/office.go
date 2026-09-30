@@ -116,6 +116,12 @@ var (
 	utf16Ole10Native  = []byte("\x01\x00O\x00l\x00e\x001\x000\x00N\x00a\x00t\x00i\x00v\x00e\x00")
 )
 
+// IsEncryptedOffice reports whether data is a password-protected Office
+// document (an OLE container wrapping an EncryptedPackage stream).
+func IsEncryptedOffice(data []byte) bool {
+	return bytes.HasPrefix(data, magicOLE) && bytes.Contains(data, utf16EncryptedPkg)
+}
+
 func analyzeVBA(mods []string) []Finding {
 	if len(mods) == 0 {
 		return nil
@@ -138,9 +144,6 @@ func analyzeOLE(data []byte) []Finding {
 	}
 	if bytes.Contains(data, utf16Ole10Native) {
 		out = append(out, Finding{"Heuristic.Office.OLEPackage", 20, "embeds an OLE package (dropped file)"})
-	}
-	if bytes.Contains(data, utf16EncryptedPkg) {
-		out = append(out, Finding{"Heuristic.Office.Encrypted", 10, "password-protected Office document; content cannot be inspected"})
 	}
 	return out
 }

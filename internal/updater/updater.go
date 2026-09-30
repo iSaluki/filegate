@@ -1,5 +1,12 @@
 // Package updater keeps FileGate's signature database current by pulling
-// hash feeds (MalwareBazaar by default) and optionally running freshclam.
+// hash feeds (MalwareBazaar, ThreatFox, URLhaus, VirusShare by default) and
+// optionally running freshclam.
+//
+// The database is split into a large base file, rebuilt on full refreshes,
+// and a small delta file that incremental updates rewrite. Each source's
+// entries are tracked, so a full refresh replaces a feed's old entries with
+// its new export while keeping entries from feeds that were not re-downloaded
+// (incremental windows, append-only shards, or feeds that failed this time).
 package updater
 
 import (
@@ -34,6 +41,7 @@ type feedState struct {
 	LastSuccess  time.Time `json:"last_success,omitempty"`
 	LastError    string    `json:"last_error,omitempty"`
 	Hashes       int       `json:"hashes"`
+	NextShard    int       `json:"next_shard,omitempty"` // append feeds
 }
 
 // State is persisted between updates.
@@ -48,8 +56,7 @@ type State struct {
 // LoadState reads the update state (zero value if absent).
 func LoadState(cfg *config.Config) State {
 	st := State{Feeds: map[string]feedState{}}
-	b, err := os.ReadFile(scanner.UpdateStatePath(cfg))
-	if err == nil {
+	if b, err := os.ReadFile(scanner.UpdateStatePath(cfg)); err == nil {
 		_ = json.Unmarshal(b, &st)
 	}
 	if st.Feeds == nil {
@@ -70,6 +77,7 @@ func saveState(cfg *config.Config, st State) error {
 type FeedReport struct {
 	Name        string `json:"name"`
 	Hashes      int    `json:"hashes"`
+	New         int    `json:"new,omitempty"`
 	NotModified bool   `json:"not_modified,omitempty"`
 	Skipped     bool   `json:"skipped,omitempty"`
 	Error       string `json:"error,omitempty"`
@@ -94,11 +102,10 @@ type Options struct {
 
 // Due reports whether an incremental update is due per the config.
 func Due(cfg *config.Config) bool {
-	st := LoadState(cfg)
 	if _, err := os.Stat(scanner.DBPath(cfg)); err != nil {
 		return true
 	}
-	return time.Since(st.LastAttempt) >= cfg.UpdateInterval.Duration
+	return time.Since(LoadState(cfg).LastAttempt) >= cfg.UpdateInterval.Duration
 }
 
 func lock(dir string) (func(), error) {
@@ -116,14 +123,22 @@ func lock(dir string) (func(), error) {
 	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
 
+type run struct {
+	cfg    *config.Config
+	st     State
+	rep    *Report
+	client *http.Client
+	logf   func(string, ...any)
+}
+
 // Run performs an update.
 func Run(ctx context.Context, cfg *config.Config, opt Options) (*Report, error) {
 	start := time.Now()
-	logf := func(format string, a ...any) {
+	r := &run{cfg: cfg, client: &http.Client{Timeout: 30 * time.Minute}, logf: func(format string, a ...any) {
 		if opt.Log != nil {
 			fmt.Fprintf(opt.Log, format+"\n", a...)
 		}
-	}
+	}}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating data dir: %w", err)
 	}
@@ -136,133 +151,319 @@ func Run(ctx context.Context, cfg *config.Config, opt Options) (*Report, error) 
 	}
 	defer unlock()
 
-	st := LoadState(cfg)
-	st.LastAttempt = time.Now()
-	dbPath := scanner.DBPath(cfg)
-	old, err := sigdb.Open(dbPath)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		logf("existing database unreadable (%v); rebuilding", err)
-		old = nil
+	r.st = LoadState(cfg)
+	r.st.LastAttempt = time.Now()
+	base := openOrNil(scanner.DBPath(cfg), r.logf)
+	delta := openOrNil(scanner.DeltaPath(cfg), r.logf)
+	if base == nil && delta != nil {
+		delta.Close() // a delta is meaningless without its base
+		delta = nil
 	}
-	defer old.Close()
+	if base == nil {
+		// Rebuilding from scratch: append-only feeds must start over.
+		for name, fs := range r.st.Feeds {
+			fs.NextShard = 0
+			r.st.Feeds[name] = fs
+		}
+	}
+	r.rep = &Report{Before: base.Count() + delta.Count()}
+	r.rep.Full = opt.Force || base == nil || time.Since(r.st.LastFull) >= cfg.FullRefreshInterval.Duration
 
-	rep := &Report{Before: old.Count()}
-	rep.Full = opt.Force || old == nil || time.Since(st.LastFull) >= cfg.FullRefreshInterval.Duration
+	if r.rep.Full {
+		err = r.full(ctx, base, delta)
+	} else {
+		err = r.incremental(ctx, base, delta)
+	}
+	base.Close()
+	delta.Close()
 
-	b := sigdb.NewBuilder()
-	fullOK, fullTried := true, false
-	anyOK := false
-	client := &http.Client{Timeout: 15 * time.Minute}
+	if set, oerr := sigdb.OpenSet(scanner.DBPath(cfg), scanner.DeltaPath(cfg)); oerr == nil {
+		r.rep.After = set.Count()
+		set.Close()
+	}
+	if err == nil {
+		r.st.LastUpdate = time.Now()
+		r.st.LastError = ""
+	} else {
+		r.st.LastError = err.Error()
+	}
+	if serr := saveState(cfg, r.st); serr != nil {
+		r.logf("warning: saving update state: %v", serr)
+	}
+	if cfg.ClamAV.RunFreshclam {
+		r.rep.Freshclam = runFreshclam(ctx, r.logf)
+	}
+	r.rep.DurationMS = time.Since(start).Milliseconds()
+	return r.rep, err
+}
 
-	for _, feed := range cfg.Feeds {
-		if !feed.Enabled {
+func openOrNil(path string, logf func(string, ...any)) *sigdb.DB {
+	db, err := sigdb.Open(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			logf("ignoring unreadable database %s: %v", path, err)
+		}
+		return nil
+	}
+	return db
+}
+
+// newBuilder creates a builder with sources registered in config order.
+func (r *run) newBuilder() (*sigdb.Builder, error) {
+	b, err := sigdb.NewBuilder(r.cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range r.cfg.Feeds {
+		if f.Enabled {
+			b.ReserveSources(f.Name)
+		}
+	}
+	return b, nil
+}
+
+func (r *run) enabledSources() map[string]bool {
+	m := map[string]bool{}
+	for _, f := range r.cfg.Feeds {
+		if f.Enabled {
+			m[f.Name] = true
+		}
+	}
+	return m
+}
+
+// full rebuilds the base from every non-append feed, carries over entries
+// from sources that were not replaced, then adds any new append shards.
+func (r *run) full(ctx context.Context, base, delta *sigdb.DB) error {
+	b, err := r.newBuilder()
+	if err != nil {
+		return err
+	}
+	defer b.Close()
+	replaced := map[string]bool{}
+	fullOK, anyOK := true, false
+	for _, feed := range r.cfg.Feeds {
+		if !feed.Enabled || feed.Refresh == "append" {
 			continue
 		}
 		fr := FeedReport{Name: feed.Name}
-		if feed.Refresh == "full" && !rep.Full {
-			fr.Skipped = true
-			rep.Feeds = append(rep.Feeds, fr)
-			continue
-		}
-		if feed.Refresh == "full" {
-			fullTried = true
-		}
-		fs := st.Feeds[feed.Name]
-		conditional := !rep.Full // full rebuilds need every feed's content
-		logf("fetching %s (%s)", feed.Name, feed.URL)
-		n, notMod, newState, err := fetchFeed(ctx, client, feed, fs, conditional, cfg.DataDir, b)
+		fs := r.st.Feeds[feed.Name]
+		r.logf("fetching %s (%s)", feed.Name, feed.URL)
+		n, _, ns, err := r.fetch(ctx, feed, fs, false, func(h *sigdb.Hash, m *sigdb.HashMD5) {
+			if h != nil {
+				b.Add(*h, feed.Name)
+			} else {
+				b.AddMD5(*m, feed.Name)
+			}
+		})
 		if err != nil {
-			fr.Error = err.Error()
-			fs.LastError = err.Error()
+			fr.Error, fs.LastError = err.Error(), err.Error()
 			if feed.Refresh == "full" {
 				fullOK = false
 			}
-			logf("  %s: error: %v", feed.Name, err)
+			r.logf("  %s: error: %v", feed.Name, err)
+		} else {
+			anyOK = true
+			fr.Hashes = n
+			ns.LastSuccess, ns.Hashes, ns.NextShard = time.Now(), n, fs.NextShard
+			fs = ns
+			if feed.Refresh == "full" {
+				replaced[feed.Name] = true
+			}
+			r.logf("  %s: %d hashes", feed.Name, n)
+		}
+		r.st.Feeds[feed.Name] = fs
+		r.rep.Feeds = append(r.rep.Feeds, fr)
+	}
+	if !anyOK {
+		return errors.New("all signature feeds failed")
+	}
+	enabled := r.enabledSources()
+	keep := func(src string) bool { return enabled[src] && !replaced[src] }
+	b.AddDB(base, keep)
+	b.AddDB(delta, keep)
+	r.logf("writing signature database (%d records before de-duplication)", b.Pending())
+	c, err := b.Write(scanner.DBPath(r.cfg))
+	if err != nil {
+		return fmt.Errorf("writing database: %w", err)
+	}
+	r.rep.Changed = true
+	_ = os.Remove(scanner.DeltaPath(r.cfg)) // folded into the base
+	r.logf("database: %d SHA-256 + %d MD5 signatures", c.SHA256, c.MD5)
+	if fullOK && anyOK {
+		r.st.LastFull = time.Now()
+	}
+	// Persist progress before the (possibly long) append pass so scanners
+	// can use the new base while shards download.
+	r.st.LastUpdate = time.Now()
+	_ = saveState(r.cfg, r.st)
+
+	// Append-only sharded feeds: fetch new shards and fold them into the base.
+	b2, err := r.newBuilder()
+	if err != nil {
+		return err
+	}
+	defer b2.Close()
+	if !r.appendFeeds(ctx, b2, nil) {
+		return nil
+	}
+	newBase, err := sigdb.Open(scanner.DBPath(r.cfg))
+	if err != nil {
+		return err
+	}
+	b2.AddDB(newBase, nil)
+	newBase.Close()
+	if c, err = b2.Write(scanner.DBPath(r.cfg)); err != nil {
+		return fmt.Errorf("writing database: %w", err)
+	}
+	r.logf("database: %d SHA-256 + %d MD5 signatures", c.SHA256, c.MD5)
+	return nil
+}
+
+// incremental fetches incremental and append feeds, keeping only hashes not
+// already in the base, and rewrites the (small) delta file.
+func (r *run) incremental(ctx context.Context, base, delta *sigdb.DB) error {
+	b, err := r.newBuilder()
+	if err != nil {
+		return err
+	}
+	defer b.Close()
+	isNew := func(h *sigdb.Hash, m *sigdb.HashMD5) bool {
+		if h != nil {
+			_, known := base.Lookup(*h)
+			return !known
+		}
+		_, known := base.LookupMD5(*m)
+		return !known
+	}
+	anyOK, attempted := false, false
+	for _, feed := range r.cfg.Feeds {
+		if !feed.Enabled || feed.Refresh == "append" {
+			continue
+		}
+		fr := FeedReport{Name: feed.Name}
+		if feed.Refresh == "full" {
+			fr.Skipped = true
+			r.rep.Feeds = append(r.rep.Feeds, fr)
+			continue
+		}
+		attempted = true
+		fs := r.st.Feeds[feed.Name]
+		r.logf("fetching %s (%s)", feed.Name, feed.URL)
+		n, notMod, ns, err := r.fetch(ctx, feed, fs, true, func(h *sigdb.Hash, m *sigdb.HashMD5) {
+			if !isNew(h, m) {
+				return
+			}
+			fr.New++
+			if h != nil {
+				b.Add(*h, feed.Name)
+			} else {
+				b.AddMD5(*m, feed.Name)
+			}
+		})
+		if err != nil {
+			fr.Error, fs.LastError = err.Error(), err.Error()
+			r.logf("  %s: error: %v", feed.Name, err)
 		} else {
 			anyOK = true
 			fr.Hashes, fr.NotModified = n, notMod
-			newState.LastSuccess = time.Now()
-			newState.LastError = ""
+			ns.LastSuccess, ns.NextShard = time.Now(), fs.NextShard
+			ns.Hashes = fs.Hashes
 			if !notMod {
-				newState.Hashes = n
-			} else {
-				newState.Hashes = fs.Hashes
+				ns.Hashes = n
 			}
-			fs = newState
-			if notMod {
-				logf("  %s: not modified", feed.Name)
-			} else {
-				logf("  %s: %d hashes", feed.Name, n)
-			}
+			fs = ns
+			r.logf("  %s: %d hashes, %d new", feed.Name, n, fr.New)
 		}
-		st.Feeds[feed.Name] = fs
-		rep.Feeds = append(rep.Feeds, fr)
+		r.st.Feeds[feed.Name] = fs
+		r.rep.Feeds = append(r.rep.Feeds, fr)
 	}
-
-	// Keep previously known hashes unless a full rebuild fully succeeded.
-	if old != nil && (!rep.Full || !fullTried || !fullOK) {
-		b.AddDB(old)
-	}
-
-	var runErr error
-	switch {
-	case !anyOK && len(rep.Feeds) > 0 && countActive(rep.Feeds) > 0:
-		runErr = errors.New("all signature feeds failed")
-	case b.Len() == 0 && old == nil:
-		logf("no hashes collected; database not written")
-	default:
-		if b.Len() != old.Count() || rep.Full || anyNew(rep.Feeds) {
-			if err := b.Write(dbPath); err != nil {
-				return rep, fmt.Errorf("writing database: %w", err)
-			}
-			rep.Changed = true
+	appended := r.appendFeeds(ctx, b, isNew)
+	for _, f := range r.rep.Feeds {
+		if f.Error == "" && !f.Skipped {
+			anyOK = true
 		}
 	}
-	rep.After = b.Len()
-	if rep.After == 0 && old != nil {
-		rep.After = old.Count()
+	if attempted && !anyOK {
+		return errors.New("all signature feeds failed")
 	}
-
-	if runErr == nil {
-		st.LastUpdate = time.Now()
-		st.LastError = ""
-		if rep.Full && fullOK && fullTried {
-			st.LastFull = time.Now()
-		}
-	} else {
-		st.LastError = runErr.Error()
+	if b.Pending() == 0 && !appended {
+		return nil
 	}
-	if err := saveState(cfg, st); err != nil {
-		logf("warning: saving update state: %v", err)
+	b.AddDB(delta, func(src string) bool { return r.enabledSources()[src] })
+	c, err := b.Write(scanner.DeltaPath(r.cfg))
+	if err != nil {
+		return fmt.Errorf("writing delta database: %w", err)
 	}
-
-	if cfg.ClamAV.RunFreshclam {
-		rep.Freshclam = runFreshclam(ctx, logf)
-	}
-	rep.DurationMS = time.Since(start).Milliseconds()
-	return rep, runErr
+	r.rep.Changed = true
+	r.logf("delta database: %d SHA-256 + %d MD5 signatures", c.SHA256, c.MD5)
+	return nil
 }
 
-func countActive(fs []FeedReport) int {
-	n := 0
-	for _, f := range fs {
-		if !f.Skipped {
-			n++
+// appendFeeds downloads shards not fetched yet. It reports whether any new
+// hashes were added. filter (optional) drops hashes already known.
+func (r *run) appendFeeds(ctx context.Context, b *sigdb.Builder, filter func(*sigdb.Hash, *sigdb.HashMD5) bool) bool {
+	added := false
+	for _, feed := range r.cfg.Feeds {
+		if !feed.Enabled || feed.Refresh != "append" {
+			continue
 		}
+		fs := r.st.Feeds[feed.Name]
+		fr := FeedReport{Name: feed.Name}
+		start := fs.NextShard
+		r.logf("fetching %s from shard %d", feed.Name, start)
+		for i := start; ctx.Err() == nil; i++ {
+			shard := feed
+			shard.URL = fmt.Sprintf(feed.URL, i)
+			n, _, _, err := r.fetch(ctx, shard, feedState{}, false, func(h *sigdb.Hash, m *sigdb.HashMD5) {
+				if filter != nil && !filter(h, m) {
+					return
+				}
+				fr.New++
+				if h != nil {
+					b.Add(*h, feed.Name)
+				} else {
+					b.AddMD5(*m, feed.Name)
+				}
+			})
+			var nf *notFoundError
+			if errors.As(err, &nf) {
+				break // no more shards published yet
+			}
+			if err != nil {
+				fr.Error, fs.LastError = err.Error(), err.Error()
+				r.logf("  %s shard %d: error: %v", feed.Name, i, err)
+				break
+			}
+			fr.Hashes += n
+			fs.NextShard = i + 1
+			fs.Hashes += n
+			if (i-start+1)%50 == 0 {
+				r.logf("  %s: %d shards fetched", feed.Name, i-start+1)
+			}
+		}
+		if fr.Error == "" {
+			fs.LastSuccess, fs.LastError = time.Now(), ""
+		}
+		if fs.NextShard > start {
+			r.logf("  %s: %d new shards, %d hashes", feed.Name, fs.NextShard-start, fr.Hashes)
+		} else {
+			fr.NotModified = fr.Error == ""
+			r.logf("  %s: no new shards", feed.Name)
+		}
+		added = added || fr.New > 0
+		r.st.Feeds[feed.Name] = fs
+		r.rep.Feeds = append(r.rep.Feeds, fr)
 	}
-	return n
+	return added
 }
 
-func anyNew(fs []FeedReport) bool {
-	for _, f := range fs {
-		if !f.Skipped && !f.NotModified && f.Error == "" && f.Hashes > 0 {
-			return true
-		}
-	}
-	return false
-}
+type notFoundError struct{ url string }
 
-func fetchFeed(ctx context.Context, client *http.Client, feed config.Feed, fs feedState, conditional bool, tmpDir string, b *sigdb.Builder) (int, bool, feedState, error) {
+func (e *notFoundError) Error() string { return "not found: " + e.url }
+
+// fetch downloads one feed and streams its hashes to fn.
+func (r *run) fetch(ctx context.Context, feed config.Feed, fs feedState, conditional bool, fn func(*sigdb.Hash, *sigdb.HashMD5)) (int, bool, feedState, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, feed.URL, nil)
 	if err != nil {
 		return 0, false, fs, err
@@ -279,63 +480,61 @@ func fetchFeed(ctx context.Context, client *http.Client, feed config.Feed, fs fe
 			req.Header.Set("If-Modified-Since", fs.LastModified)
 		}
 	}
-	resp, err := client.Do(req)
+	resp, err := r.client.Do(req)
 	if err != nil {
 		return 0, false, fs, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotModified {
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotModified:
 		return 0, true, fs, nil
-	}
-	if resp.StatusCode != http.StatusOK {
+	case http.StatusNotFound:
+		return 0, false, fs, &notFoundError{feed.URL}
+	default:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return 0, false, fs, fmt.Errorf("HTTP %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	ns := feedState{ETag: resp.Header.Get("ETag"), LastModified: resp.Header.Get("Last-Modified")}
 
-	switch feed.Format {
-	case "zip":
-		tmp, err := os.CreateTemp(tmpDir, ".feed-*.zip")
-		if err != nil {
-			return 0, false, fs, err
-		}
-		defer os.Remove(tmp.Name())
-		defer tmp.Close()
-		size, err := io.Copy(tmp, io.LimitReader(resp.Body, 2<<30))
-		if err != nil {
-			return 0, false, fs, err
-		}
-		zr, err := zip.NewReader(tmp, size)
-		if err != nil {
-			return 0, false, fs, fmt.Errorf("feed is not a valid zip: %w", err)
-		}
-		total := 0
-		for _, f := range zr.File {
-			if f.FileInfo().IsDir() {
-				continue
-			}
-			rc, err := f.Open()
-			if err != nil {
-				return total, false, fs, err
-			}
-			n, err := b.ReadHashList(io.LimitReader(rc, 4<<30), feed.Name)
-			rc.Close()
-			total += n
-			if err != nil {
-				return total, false, fs, err
-			}
-		}
-		if total == 0 {
-			return 0, false, fs, errors.New("feed contained no SHA-256 hashes")
-		}
-		return total, false, ns, nil
-	default:
-		n, err := b.ReadHashList(io.LimitReader(resp.Body, 2<<30), feed.Name)
-		if err != nil {
-			return n, false, fs, err
-		}
-		return n, false, ns, nil
+	if feed.Format != "zip" {
+		n, err := sigdb.ReadHashes(io.LimitReader(resp.Body, 8<<30), fn)
+		return n, false, ns, err
 	}
+	tmp, err := os.CreateTemp(r.cfg.DataDir, ".feed-*.zip")
+	if err != nil {
+		return 0, false, fs, err
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	size, err := io.Copy(tmp, io.LimitReader(resp.Body, 4<<30))
+	if err != nil {
+		return 0, false, fs, err
+	}
+	zr, err := zip.NewReader(tmp, size)
+	if err != nil {
+		return 0, false, fs, fmt.Errorf("feed is not a valid zip: %w", err)
+	}
+	total := 0
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return total, false, fs, err
+		}
+		n, err := sigdb.ReadHashes(io.LimitReader(rc, 16<<30), fn)
+		rc.Close()
+		total += n
+		if err != nil {
+			return total, false, fs, err
+		}
+	}
+	if total == 0 {
+		return 0, false, fs, errors.New("feed contained no hashes")
+	}
+	return total, false, ns, nil
 }
 
 func runFreshclam(ctx context.Context, logf func(string, ...any)) string {
@@ -348,8 +547,7 @@ func runFreshclam(ctx context.Context, logf func(string, ...any)) string {
 	defer cancel()
 	out, err := exec.CommandContext(ctx, bin, "--quiet", "--stdout").CombinedOutput()
 	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		logf("freshclam failed: %v %s", err, msg)
+		logf("freshclam failed: %v %s", err, strings.TrimSpace(string(out)))
 		return "error: " + err.Error()
 	}
 	logf("freshclam: ClamAV databases up to date")

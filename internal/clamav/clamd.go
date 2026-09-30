@@ -100,7 +100,13 @@ func (c *Client) Ping(ctx context.Context) error {
 }
 
 // Version returns clamd's engine/database version string.
-func (c *Client) Version(ctx context.Context) (string, error) { return c.command(ctx, "VERSION") }
+func (c *Client) Version(ctx context.Context) (string, error) {
+	v, err := c.command(ctx, "VERSION")
+	if err == nil && !strings.HasPrefix(v, "ClamAV") {
+		return "", fmt.Errorf("clamd: %s", v) // e.g. "COMMAND UNAVAILABLE"
+	}
+	return v, err
+}
 
 // ErrSizeLimit is returned when clamd rejects the stream as too large.
 var ErrSizeLimit = errors.New("clamd: INSTREAM size limit exceeded")
@@ -116,6 +122,15 @@ func (c *Client) Scan(ctx context.Context, r io.Reader) (string, bool, error) {
 	if _, err := w.WriteString("zINSTREAM\x00"); err != nil {
 		return "", false, err
 	}
+	// clamd replies and closes the connection early when a stream exceeds
+	// StreamMaxLength; surface that reply instead of the write error.
+	early := func(werr error) (string, bool, error) {
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if resp, _ := bufio.NewReader(conn).ReadString(0); resp != "" {
+			return parseReply(strings.TrimRight(resp, "\x00\n"))
+		}
+		return "", false, werr
+	}
 	buf := make([]byte, 32*1024)
 	var hdr [4]byte
 	for {
@@ -123,10 +138,10 @@ func (c *Client) Scan(ctx context.Context, r io.Reader) (string, bool, error) {
 		if n > 0 {
 			binary.BigEndian.PutUint32(hdr[:], uint32(n))
 			if _, err := w.Write(hdr[:]); err != nil {
-				return "", false, err
+				return early(err)
 			}
 			if _, err := w.Write(buf[:n]); err != nil {
-				return "", false, err
+				return early(err)
 			}
 		}
 		if rerr == io.EOF {
@@ -137,10 +152,10 @@ func (c *Client) Scan(ctx context.Context, r io.Reader) (string, bool, error) {
 		}
 	}
 	if _, err := w.Write([]byte{0, 0, 0, 0}); err != nil {
-		return "", false, err
+		return early(err)
 	}
 	if err := w.Flush(); err != nil {
-		return "", false, err
+		return early(err)
 	}
 	resp, err := bufio.NewReader(conn).ReadString(0)
 	if err != nil && resp == "" {
