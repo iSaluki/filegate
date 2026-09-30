@@ -54,7 +54,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	mux.Handle("GET /v1/status", s.auth(http.HandlerFunc(s.handleStatus)))
 	mux.Handle("POST /v1/scan", s.auth(http.HandlerFunc(s.handleScan)))
-	mux.Handle("GET /v1/hash/{sha256}", s.auth(http.HandlerFunc(s.handleHash)))
+	mux.Handle("GET /v1/hash/{hash}", s.auth(http.HandlerFunc(s.handleHash)))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 	})
@@ -144,7 +144,52 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": s.version})
+	rd := updater.Check(s.cfg, s.scanner.SignatureCount())
+	if rd.NeedUpdate {
+		go s.maybeUpdate(context.WithoutCancel(r.Context()), true)
+	}
+	resp := map[string]any{"status": "ok", "version": s.version}
+	switch {
+	case rd.Err != nil:
+		resp["status"], resp["error"] = "not_ready", rd.Err.Error()
+	case !rd.Ready:
+		resp["status"], resp["error"] = "updating", rd.Reason
+	default:
+		if err := s.scanner.ClamAVReady(r.Context()); err != nil {
+			resp["status"], resp["error"] = "not_ready", err.Error()
+		}
+	}
+	code := http.StatusOK
+	if resp["status"] != "ok" {
+		code = http.StatusServiceUnavailable
+	}
+	writeJSON(w, code, resp)
+}
+
+// gate answers "retry" (and starts an update) when the signature database is
+// missing or stale, or "error" if updating is currently failing. It reports
+// whether the scan may proceed.
+func (s *Server) gate(w http.ResponseWriter, r *http.Request) bool {
+	rd := updater.Check(s.cfg, s.scanner.SignatureCount())
+	if rd.Ready {
+		return true
+	}
+	if rd.Err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"verdict": scanner.VerdictError, "error": rd.Err.Error()})
+		return false
+	}
+	if rd.NeedUpdate {
+		go s.maybeUpdate(context.WithoutCancel(r.Context()), true)
+	}
+	secs := int(updater.RetryAfter.Seconds())
+	w.Header().Set("Retry-After", fmt.Sprint(secs))
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+		"verdict":             scanner.VerdictRetry,
+		"reason":              rd.Reason,
+		"retry_after_seconds": secs,
+		"note":                "the signature database is being updated; resend this file shortly",
+	})
+	return false
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -166,59 +211,84 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHash(w http.ResponseWriter, r *http.Request) {
-	hs := strings.ToLower(r.PathValue("sha256"))
-	var h sigdb.Hash
-	if len(hs) != 64 {
-		writeError(w, http.StatusBadRequest, "expected a 64-character hex SHA-256")
+	hs := strings.ToLower(r.PathValue("hash"))
+	raw, err := hex.DecodeString(hs)
+	if err != nil || (len(raw) != 32 && len(raw) != 16) {
+		writeError(w, http.StatusBadRequest, "expected a hex SHA-256 (64 chars) or MD5 (32 chars)")
 		return
 	}
-	if _, err := hex.Decode(h[:], []byte(hs)); err != nil {
-		writeError(w, http.StatusBadRequest, "expected a 64-character hex SHA-256")
-		return
-	}
-	d, hit, allowed := s.scanner.LookupHash(h)
-	resp := map[string]any{"sha256": hs, "known": hit, "verdict": scanner.VerdictSafe, "allowlisted": allowed}
-	if hit {
-		resp["verdict"] = scanner.VerdictMalicious
-		resp["detection"] = d
+	var d scanner.Detection
+	var hit, allowed bool
+	if len(raw) == 32 {
+		var h sigdb.Hash
+		copy(h[:], raw)
+		d, hit, allowed = s.scanner.LookupHash(h, nil)
 	} else {
-		resp["note"] = "hash not in signature database; upload the file to /v1/scan for full analysis"
+		var h sigdb.HashMD5
+		copy(h[:], raw)
+		d, hit, _ = s.scanner.LookupHash(sigdb.Hash{}, &h)
+	}
+	resp := map[string]any{"hash": hs, "known": hit}
+	switch {
+	case hit:
+		resp["verdict"], resp["detection"] = scanner.VerdictMalicious, d
+	case allowed:
+		resp["verdict"], resp["allowlisted"] = scanner.VerdictSafe, true
+	default:
+		// Absence from hash lists says nothing about safety.
+		resp["verdict"] = "unknown"
+		resp["note"] = "hash not in the signature database; upload the file to /v1/scan for a verdict"
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 var errTooLarge = errors.New("upload too large")
 
-// readUpload returns the uploaded file name and content from either a
-// multipart form (field "file") or a raw request body.
-func (s *Server) readUpload(r *http.Request) (string, []byte, error) {
+// readUpload returns the uploaded file name, content and optional archive
+// password from either a multipart form (fields "file" and "password") or a
+// raw request body (password in the X-Archive-Password header). Passwords
+// are deliberately not accepted in the URL, which ends up in access logs.
+func (s *Server) readUpload(r *http.Request) (string, []byte, string, error) {
 	limit := s.cfg.API.MaxUploadSize
 	name := r.URL.Query().Get("filename")
+	password := r.Header.Get("X-Archive-Password")
 	ct, params, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if ct == "multipart/form-data" && params["boundary"] != "" {
 		mr, err := r.MultipartReader()
 		if err != nil {
-			return "", nil, err
+			return "", nil, "", err
 		}
+		var data []byte
+		found := false
 		for {
 			p, err := mr.NextPart()
 			if err == io.EOF {
-				return "", nil, errors.New(`multipart body has no "file" field`)
+				break
 			}
 			if err != nil {
-				return "", nil, err
+				return "", nil, "", err
 			}
-			if p.FormName() != "file" {
-				p.Close()
-				continue
+			switch p.FormName() {
+			case "file":
+				if name == "" {
+					name = p.FileName()
+				}
+				data, err = readLimited(p, limit)
+				found = true
+			case "password":
+				var b []byte
+				b, err = readLimited(p, 1024)
+				password = string(b)
 			}
-			if name == "" {
-				name = p.FileName()
-			}
-			data, err := readLimited(p, limit)
 			p.Close()
-			return name, data, err
+			if err != nil {
+				return "", nil, "", err
+			}
 		}
+		if !found {
+			return "", nil, "", errors.New(`multipart body has no "file" field`)
+		}
+		return name, data, password, nil
 	}
 	if name == "" {
 		if _, params, err := mime.ParseMediaType(r.Header.Get("Content-Disposition")); err == nil {
@@ -226,7 +296,7 @@ func (s *Server) readUpload(r *http.Request) (string, []byte, error) {
 		}
 	}
 	data, err := readLimited(r.Body, limit)
-	return name, data, err
+	return name, data, password, err
 }
 
 func readLimited(rd io.Reader, limit int64) ([]byte, error) {
@@ -245,8 +315,11 @@ func readLimited(rd io.Reader, limit int64) ([]byte, error) {
 }
 
 func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
+	if !s.gate(w, r) {
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.API.MaxUploadSize+1<<20)
-	name, data, err := s.readUpload(r)
+	name, data, password, err := s.readUpload(r)
 	if err != nil {
 		if errors.Is(err, errTooLarge) {
 			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload exceeds max_upload_size (%d bytes)", s.cfg.API.MaxUploadSize))
@@ -271,11 +344,16 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "request cancelled while waiting for a scan slot")
 		return
 	}
-	res := s.scanner.ScanBytes(r.Context(), name, data)
+	res := s.scanner.ScanBytesWith(r.Context(), name, data, scanner.Options{Password: password})
 	k, _ := r.Context().Value(ctxKey{}).(apikey.Key)
 	s.log.Info("scan", "file", name, "size", len(data), "sha256", res.SHA256, "verdict", res.Verdict,
 		"score", res.Score, "detections", len(res.Detections), "key", k.Name, "duration_ms", res.DurationMS)
-	writeJSON(w, http.StatusOK, res)
+	status := http.StatusOK
+	if res.Failed() {
+		// No trustworthy verdict: the body explains what could not be inspected.
+		status = http.StatusUnprocessableEntity
+	}
+	writeJSON(w, status, res)
 }
 
 // Run serves until ctx is cancelled, reloading the signature database when
@@ -319,7 +397,7 @@ func (s *Server) background(ctx context.Context) {
 		t := time.NewTicker(time.Minute)
 		defer t.Stop()
 		upd = t.C
-		go s.maybeUpdate(ctx)
+		go s.maybeUpdate(ctx, false)
 	}
 	for {
 		select {
@@ -332,19 +410,19 @@ func (s *Server) background(ctx context.Context) {
 				s.log.Info("signature database reloaded", "signatures", s.scanner.Info(ctx).SignatureCount)
 			}
 		case <-upd:
-			go s.maybeUpdate(ctx)
+			go s.maybeUpdate(ctx, false)
 		}
 	}
 }
 
-func (s *Server) maybeUpdate(ctx context.Context) {
+func (s *Server) maybeUpdate(ctx context.Context, force bool) {
 	select {
 	case s.updating <- struct{}{}:
 		defer func() { <-s.updating }()
 	default:
 		return
 	}
-	if !updater.Due(s.cfg) {
+	if !force && !updater.Due(s.cfg) {
 		return
 	}
 	s.log.Info("running scheduled signature update")

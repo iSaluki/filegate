@@ -27,22 +27,32 @@ type Budget struct {
 
 // Options configure extraction.
 type Options struct {
-	MaxEntrySize              int64
-	MaxCompressRatio          int
-	BlockEncryptedExecutables bool
+	MaxEntrySize     int64
+	MaxCompressRatio int
+	// Password decrypts password-protected zip members. FileGate never
+	// guesses passwords: without the right one, members are unscannable.
+	Password string
 }
+
+// ErrPasswordProtected is the unscannable reason for encrypted archives.
+const ErrPasswordProtected = "Archive is password protected and no valid password was specified"
 
 // Result carries findings about the container itself.
 type Result struct {
 	Findings []heuristics.Finding
 	Warnings []string
+	// Unscannable lists content that could not be inspected (unknown
+	// password, unsupported format, limits hit). Callers decide whether
+	// that fails closed.
+	Unscannable []string
 }
 
 // ErrStop can be returned by the callback to abort extraction.
 var ErrStop = errors.New("stop extraction")
 
-// EntryFunc receives each extracted file.
-type EntryFunc func(name string, data []byte) error
+// EntryFunc receives each extracted file. decrypted is true for members
+// FileGate decrypted itself (content other engines cannot see).
+type EntryFunc func(name string, data []byte, decrypted bool) error
 
 // Extract unpacks data of type ft and calls fn for each member.
 func Extract(ft heuristics.FileType, name string, data []byte, b *Budget, opt Options, fn EntryFunc) Result {
@@ -71,11 +81,11 @@ func Extract(ft heuristics.FileType, name string, data []byte, b *Budget, opt Op
 			return zr, "", err
 		}, ".xz", ".txz")
 	default:
-		r.Warnings = append(r.Warnings, fmt.Sprintf("%s: %s archives are not unpacked by the built-in engine", name, ft))
+		r.Unscannable = append(r.Unscannable, fmt.Sprintf("%s archives are not unpacked by the built-in engine", ft))
 		return r
 	}
 	if err != nil && !errors.Is(err, ErrStop) {
-		r.Warnings = append(r.Warnings, fmt.Sprintf("%s: %v", name, err))
+		r.Unscannable = append(r.Unscannable, err.Error())
 	}
 	return r
 }
@@ -86,14 +96,16 @@ func bomb(desc string) heuristics.Finding {
 
 // readBounded reads rd up to the per-entry and budget limits. It reports
 // whether the limit was hit.
-func readBounded(rd io.Reader, b *Budget, opt Options) ([]byte, bool, error) {
+func entryLimit(b *Budget, opt Options) int64 {
 	limit := b.Bytes
 	if opt.MaxEntrySize > 0 && opt.MaxEntrySize < limit {
 		limit = opt.MaxEntrySize
 	}
-	if limit < 0 {
-		limit = 0
-	}
+	return max(limit, 0)
+}
+
+func readBounded(rd io.Reader, b *Budget, opt Options) ([]byte, bool, error) {
+	limit := entryLimit(b, opt)
 	buf, err := io.ReadAll(io.LimitReader(rd, limit+1))
 	over := int64(len(buf)) > limit
 	if over {
@@ -120,7 +132,7 @@ func extractZip(data []byte, b *Budget, opt Options, fn EntryFunc, r *Result) er
 	if err != nil {
 		return fmt.Errorf("corrupt zip: %w", err)
 	}
-	encrypted, riskyEncrypted := 0, 0
+	locked := false
 	var extracted int64
 	traversal := false
 	for _, f := range zr.File {
@@ -130,15 +142,8 @@ func extractZip(data []byte, b *Budget, opt Options, fn EntryFunc, r *Result) er
 		if unsafePath(f.Name) {
 			traversal = true
 		}
-		if f.Flags&0x1 != 0 {
-			encrypted++
-			if heuristics.IsRiskyName(f.Name) {
-				riskyEncrypted++
-			}
-			continue
-		}
 		if b.Files <= 0 {
-			r.Warnings = append(r.Warnings, "object limit reached; remaining archive members not scanned")
+			r.Unscannable = append(r.Unscannable, "object limit reached; remaining archive members not scanned")
 			break
 		}
 		if b.Bytes <= 0 {
@@ -146,16 +151,36 @@ func extractZip(data []byte, b *Budget, opt Options, fn EntryFunc, r *Result) er
 				r.Findings = append(r.Findings, bomb("archive expands beyond scan limits at an extreme compression ratio (zip bomb)"))
 				return ErrStop
 			}
-			r.Warnings = append(r.Warnings, "decompression budget exhausted; remaining archive members not scanned")
+			r.Unscannable = append(r.Unscannable, "decompression budget exhausted; remaining archive members not scanned")
 			break
 		}
-		rc, err := f.Open()
-		if err != nil {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("%s: %v", f.Name, err))
-			continue
+		var buf []byte
+		var over bool
+		var err error
+		if f.Flags&0x1 != 0 {
+			if opt.Password == "" {
+				locked = true
+				continue
+			}
+			buf, over, err = decryptZipEntry(f, []string{opt.Password}, entryLimit(b, opt))
+			if errors.Is(err, errNoPassword) {
+				locked = true
+				continue
+			}
+			if err != nil {
+				r.Unscannable = append(r.Unscannable, fmt.Sprintf("%s: cannot decrypt: %v", f.Name, err))
+				continue
+			}
+			b.Bytes -= int64(len(buf))
+		} else {
+			rc, oerr := f.Open()
+			if oerr != nil {
+				r.Unscannable = append(r.Unscannable, fmt.Sprintf("%s: %v", f.Name, oerr))
+				continue
+			}
+			buf, over, err = readBounded(rc, b, opt)
+			rc.Close()
 		}
-		buf, over, err := readBounded(rc, b, opt)
-		rc.Close()
 		extracted += int64(len(buf))
 		if over {
 			// archive/zip refuses to return more than the declared size, so
@@ -164,26 +189,21 @@ func extractZip(data []byte, b *Budget, opt Options, fn EntryFunc, r *Result) er
 				r.Findings = append(r.Findings, bomb(fmt.Sprintf("member %q decompresses beyond limits at >%d:1 (zip bomb)", f.Name, opt.MaxCompressRatio)))
 				return ErrStop
 			}
-			r.Warnings = append(r.Warnings, fmt.Sprintf("%s: exceeds size limit; only the first %d bytes were scanned", f.Name, len(buf)))
+			r.Unscannable = append(r.Unscannable, fmt.Sprintf("%s: exceeds size limit; only the first %d bytes were scanned", f.Name, len(buf)))
 		}
 		if err != nil && !errors.Is(err, zip.ErrChecksum) {
 			r.Warnings = append(r.Warnings, fmt.Sprintf("%s: %v", f.Name, err))
 		}
 		b.Files--
-		if err := fn(f.Name, buf); err != nil {
+		if err := fn(f.Name, buf, f.Flags&0x1 != 0); err != nil {
 			return err
 		}
 	}
 	if traversal {
 		r.Findings = append(r.Findings, heuristics.Finding{Name: "Heuristic.Archive.PathTraversal", Score: 40, Description: "archive members escape the extraction directory (zip slip)"})
 	}
-	if encrypted > 0 {
-		r.Findings = append(r.Findings, heuristics.Finding{Name: "Heuristic.Archive.Encrypted", Score: 10,
-			Description: fmt.Sprintf("%d password-protected member(s) could not be inspected", encrypted)})
-		if riskyEncrypted > 0 && opt.BlockEncryptedExecutables {
-			r.Findings = append(r.Findings, heuristics.Finding{Name: "Heuristic.Archive.EncryptedExecutable", Score: 90,
-				Description: "password-protected archive hides executables/scripts (common malware delivery technique)"})
-		}
+	if locked {
+		r.Unscannable = append(r.Unscannable, ErrPasswordProtected)
 	}
 	return nil
 }
@@ -206,7 +226,7 @@ func extractTar(rd io.Reader, b *Budget, opt Options, fn EntryFunc, r *Result) e
 			traversal = true
 		}
 		if b.Files <= 0 || b.Bytes <= 0 {
-			r.Warnings = append(r.Warnings, "scan limits reached; remaining tar members not scanned")
+			r.Unscannable = append(r.Unscannable, "scan limits reached; remaining tar members not scanned")
 			break
 		}
 		buf, over, err := readBounded(tr, b, opt)
@@ -214,10 +234,10 @@ func extractTar(rd io.Reader, b *Budget, opt Options, fn EntryFunc, r *Result) e
 			return err
 		}
 		if over {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("%s: exceeds size limit; only the first %d bytes were scanned", h.Name, len(buf)))
+			r.Unscannable = append(r.Unscannable, fmt.Sprintf("%s: exceeds size limit; only the first %d bytes were scanned", h.Name, len(buf)))
 		}
 		b.Files--
-		if err := fn(h.Name, buf); err != nil {
+		if err := fn(h.Name, buf, false); err != nil {
 			return err
 		}
 	}
@@ -247,7 +267,7 @@ func extractStream(name string, data []byte, b *Budget, opt Options, fn EntryFun
 		return err
 	}
 	if b.Files <= 0 || b.Bytes <= 0 {
-		r.Warnings = append(r.Warnings, "scan limits reached; compressed stream not scanned")
+		r.Unscannable = append(r.Unscannable, "scan limits reached; compressed stream not scanned")
 		return nil
 	}
 	buf, over, err := readBounded(rd, b, opt)
@@ -257,7 +277,7 @@ func extractStream(name string, data []byte, b *Budget, opt Options, fn EntryFun
 			r.Findings = append(r.Findings, bomb(fmt.Sprintf("stream decompresses beyond limits at >%d:1 (compression bomb)", opt.MaxCompressRatio)))
 			return ErrStop
 		}
-		r.Warnings = append(r.Warnings, fmt.Sprintf("%s: decompressed data exceeds size limit; only the first %d bytes were scanned", name, len(buf)))
+		r.Unscannable = append(r.Unscannable, fmt.Sprintf("%s: decompressed data exceeds size limit; only the first %d bytes were scanned", name, len(buf)))
 	}
 	if err != nil && len(buf) == 0 {
 		return err
@@ -269,7 +289,7 @@ func extractStream(name string, data []byte, b *Budget, opt Options, fn EntryFun
 		inner = innerName(path.Base(name), exts)
 	}
 	b.Files--
-	return fn(inner, buf)
+	return fn(inner, buf, false)
 }
 
 func innerName(base string, exts []string) string {

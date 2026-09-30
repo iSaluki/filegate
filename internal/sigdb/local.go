@@ -12,11 +12,12 @@ import (
 // allowlist). Each line: "<sha256> [optional name...]".
 type LocalList struct {
 	entries map[Hash]string
+	md5     map[HashMD5]string
 }
 
 // LoadLocalList reads every *.txt file in dir. A missing dir yields an empty list.
 func LoadLocalList(dir string) (*LocalList, error) {
-	l := &LocalList{entries: map[Hash]string{}}
+	l := &LocalList{entries: map[Hash]string{}, md5: map[HashMD5]string{}}
 	files, err := filepath.Glob(filepath.Join(dir, "*.txt"))
 	if err != nil {
 		return l, err
@@ -43,18 +44,22 @@ func (l *LocalList) loadFile(fn string) error {
 			continue
 		}
 		fields := strings.Fields(line)
-		var h Hash
-		if len(fields[0]) != 64 {
-			continue
-		}
-		if _, err := hex.Decode(h[:], []byte(strings.ToLower(fields[0]))); err != nil {
-			continue
-		}
 		name := base
 		if len(fields) > 1 {
 			name = strings.Join(fields[1:], " ")
 		}
-		l.entries[h] = name
+		switch len(fields[0]) {
+		case 64:
+			var h Hash
+			if _, err := hex.Decode(h[:], []byte(fields[0])); err == nil {
+				l.entries[h] = name
+			}
+		case 32:
+			var h HashMD5
+			if _, err := hex.Decode(h[:], []byte(fields[0])); err == nil {
+				l.md5[h] = name
+			}
+		}
 	}
 	return sc.Err()
 }
@@ -68,10 +73,19 @@ func (l *LocalList) Lookup(h Hash) (string, bool) {
 	return n, ok
 }
 
+// LookupMD5 returns the entry's name if present.
+func (l *LocalList) LookupMD5(h HashMD5) (string, bool) {
+	if l == nil {
+		return "", false
+	}
+	n, ok := l.md5[h]
+	return n, ok
+}
+
 // Len returns the number of entries.
 func (l *LocalList) Len() int {
 	if l == nil {
 		return 0
 	}
-	return len(l.entries)
+	return len(l.entries) + len(l.md5)
 }

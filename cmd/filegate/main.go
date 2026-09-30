@@ -36,6 +36,7 @@ const (
 	exitSafe      = 0
 	exitMalicious = 1
 	exitError     = 2
+	exitRetry     = 3
 )
 
 const usage = `FileGate - fast malware verdicts for files and archives
@@ -55,7 +56,13 @@ Commands:
   config show|init        Print the effective config / write a default config file
   version                 Print the version
 
-Exit codes for scan: 0 = all safe, 1 = malicious found, 2 = error.
+Exit codes for scan:
+  0 = all files safe
+  1 = malicious content found
+  2 = error: a file could not be fully inspected (e.g. password-protected
+      archive without --password) or an engine is unavailable; never treat as safe
+  3 = retry: the signature database is being downloaded; run the scan again
+      shortly
 Run 'filegate <command> -h' for command options.
 `
 
@@ -155,6 +162,8 @@ func cmdScan(ctx context.Context, cfg *config.Config, args []string, stdout, std
 	noHeur := fs.Bool("no-heuristics", false, "disable the heuristic engine (signatures only)")
 	noClam := fs.Bool("no-clamav", false, "do not use ClamAV even if available")
 	name := fs.String("name", "", "file name to assume when scanning stdin")
+	noSigs := fs.Bool("allow-no-signatures", false, "scan even if the signature database is missing or stale (NOT recommended)")
+	password := fs.String("password", "", "password for password-protected archives (FileGate never guesses passwords)")
 	if err := fs.Parse(args); err != nil {
 		return exitError, err
 	}
@@ -172,9 +181,13 @@ func cmdScan(ctx context.Context, cfg *config.Config, args []string, stdout, std
 	if err != nil {
 		return exitError, err
 	}
-	if sc.Info(ctx).SignatureCount == 0 && !*jsonOut && !*quiet {
-		fmt.Fprintln(stderr, "warning: signature database is empty; run 'filegate update' (heuristics are still active)")
+	if *noSigs {
+		cfg.Policy.RequireSignatures = false
 	}
+	if code, err := scanGate(ctx, cfg, sc, fs.Args(), *jsonOut, stdout, stderr); code != exitSafe || err != nil {
+		return code, err
+	}
+	opts := scanner.Options{Password: *password}
 
 	var mu sync.Mutex
 	malicious, failed := 0, 0
@@ -193,6 +206,8 @@ func cmdScan(ctx context.Context, cfg *config.Config, args []string, stdout, std
 		}
 		if r.Malicious() {
 			malicious++
+		} else if r.Failed() {
+			failed++
 		}
 		if *jsonOut {
 			_ = enc.Encode(r)
@@ -208,7 +223,7 @@ func cmdScan(ctx context.Context, cfg *config.Config, args []string, stdout, std
 		go func() {
 			defer wg.Done()
 			for p := range paths {
-				r, err := sc.ScanFile(ctx, p)
+				r, err := sc.ScanFileWith(ctx, p, opts)
 				report(r, err, p)
 			}
 		}()
@@ -231,7 +246,7 @@ func cmdScan(ctx context.Context, cfg *config.Config, args []string, stdout, std
 			if n == "" {
 				n = "stdin"
 			}
-			report(sc.ScanBytes(ctx, n, data), nil, "-")
+			report(sc.ScanBytesWith(ctx, n, data, opts), nil, "-")
 			continue
 		}
 		fi, err := os.Stat(arg)
@@ -272,7 +287,59 @@ func cmdScan(ctx context.Context, cfg *config.Config, args []string, stdout, std
 	return exitSafe, nil
 }
 
+// scanGate checks that verdicts will be trustworthy before scanning. When
+// the signature database is missing or stale it starts an update in the
+// background and answers "retry" (exit 3) for every file.
+func scanGate(ctx context.Context, cfg *config.Config, sc *scanner.Scanner, files []string, jsonOut bool, stdout, stderr io.Writer) (int, error) {
+	rd := updater.Check(cfg, sc.SignatureCount())
+	switch {
+	case rd.Err != nil:
+		return exitError, fmt.Errorf("%w [data dir: %s]", rd.Err, cfg.DataDir)
+	case rd.NeedUpdate:
+		if !updater.CanWrite(cfg) {
+			return exitError, fmt.Errorf("%s, and this user cannot update it in %s; run 'sudo filegate update'",
+				strings.TrimSuffix(rd.Reason, "; an update has been started"), cfg.DataDir)
+		}
+		if err := updater.StartDetached(cfg); err != nil {
+			return exitError, fmt.Errorf("starting signature update: %w", err)
+		}
+		fallthrough
+	case rd.Updating:
+		secs := int(updater.RetryAfter.Seconds())
+		for _, f := range files {
+			if jsonOut {
+				_ = json.NewEncoder(stdout).Encode(map[string]any{"file": f, "verdict": scanner.VerdictRetry,
+					"reason": rd.Reason, "retry_after_seconds": secs})
+			} else {
+				fmt.Fprintf(stdout, "%s: RETRY (%s)\n", f, rd.Reason)
+			}
+		}
+		if !jsonOut {
+			fmt.Fprintf(stderr, "Run the scan again in about %ds (progress: %s).\n", secs, filepath.Join(cfg.DataDir, "update.log"))
+		}
+		return exitRetry, nil
+	}
+	if err := sc.ClamAVReady(ctx); err != nil {
+		return exitError, err
+	}
+	return exitSafe, nil
+}
+
 func printResult(w io.Writer, r *scanner.Result, quiet, verbose bool) {
+	if r.Failed() {
+		fmt.Fprintf(w, "%s: ERROR %s\n", r.File, r.Error)
+		if verbose || len(r.Unscannable) > 1 {
+			for _, u := range r.Unscannable {
+				if u.Object != "" {
+					fmt.Fprintf(w, "    cannot inspect %s: %s\n", u.Object, u.Reason)
+				} else {
+					fmt.Fprintf(w, "    cannot inspect: %s\n", u.Reason)
+				}
+			}
+		}
+		printDetails(w, r, verbose)
+		return
+	}
 	if !r.Malicious() {
 		if quiet {
 			return
@@ -399,6 +466,9 @@ func cmdStatus(ctx context.Context, cfg *config.Config, args []string, stdout, s
 		clam += " - " + info.ClamAVVersion
 	}
 	fmt.Fprintf(tw, "ClamAV:\t%s\n", clam)
+	if err := sc.ClamAVReady(ctx); err != nil {
+		defer fmt.Fprintf(stdout, "\n%v\n", err)
+	}
 	fmt.Fprintf(tw, "Last update:\t%s\n", fmtTime(st.LastUpdate))
 	fmt.Fprintf(tw, "Last full refresh:\t%s\n", fmtTime(st.LastFull))
 	if st.LastError != "" {

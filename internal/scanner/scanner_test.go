@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/isaluki/filegate/internal/archive"
 	"github.com/isaluki/filegate/internal/config"
 	"github.com/isaluki/filegate/internal/sigdb"
 )
@@ -25,10 +27,25 @@ func eicar() []byte {
 func testConfig(t *testing.T) *config.Config {
 	t.Helper()
 	cfg := config.Default(t.TempDir())
-	cfg.ClamAV.Enabled = "off"
+	cfg.ClamAV.Enabled = "off" // tests that need ClamAV use a fake clamd
 	cfg.Limits.MaxFileSize = 8 << 20
 	cfg.Limits.MaxTotalExtract = 64 << 20
+	// A loaded signature DB is required for trustworthy verdicts.
+	writeDB(t, DBPath(cfg), func(b *sigdb.Builder) { b.Add(sha256.Sum256([]byte("unrelated")), "fixture") })
 	return cfg
+}
+
+func writeDB(t *testing.T, path string, fill func(*sigdb.Builder)) {
+	t.Helper()
+	b, err := sigdb.NewBuilder(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	fill(b)
+	if _, err := b.Write(path); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func newScanner(t *testing.T, cfg *config.Config) *Scanner {
@@ -133,8 +150,8 @@ func TestEncryptedExecutable(t *testing.T) {
 	w.Write([]byte("encrypted-garbage"))
 	zw.Close()
 	r := s.ScanBytes(context.Background(), "invoice.zip", b.Bytes())
-	if !r.Malicious() {
-		t.Fatalf("encrypted executable archive not flagged: %+v", r)
+	if r.Verdict != VerdictError || r.Error != archive.ErrPasswordProtected {
+		t.Fatalf("encrypted archive without password = %+v", r)
 	}
 }
 
@@ -143,11 +160,7 @@ func TestHashSignatureAndAllowlist(t *testing.T) {
 	sample := []byte("pretend this is a known malware sample")
 	sum := sha256.Sum256(sample)
 
-	b := sigdb.NewBuilder()
-	b.Add(sum, "testfeed")
-	if err := b.Write(DBPath(cfg)); err != nil {
-		t.Fatal(err)
-	}
+	writeDB(t, DBPath(cfg), func(b *sigdb.Builder) { b.Add(sum, "testfeed") })
 	s := newScanner(t, cfg)
 	r := s.ScanBytes(context.Background(), "x.bin", sample)
 	if !r.Malicious() || r.Detections[0].Engine != EngineSignature || !strings.Contains(r.Detections[0].Name, "testfeed") {
@@ -195,7 +208,8 @@ func TestScanFileLarge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Verdict != VerdictSafe || len(r.Warnings) == 0 || r.Size != 4096 {
+	// Too large to analyse and no ClamAV: must not be reported as safe.
+	if r.Verdict != VerdictError || r.Size != 4096 {
 		t.Fatalf("unexpected result for large file: %+v", r)
 	}
 }
@@ -231,5 +245,148 @@ func TestWindowsExecutableMasquerade(t *testing.T) {
 	r := s.ScanBytes(context.Background(), "Invoice_2024.pdf.exe", data)
 	if !r.Malicious() {
 		t.Errorf("double-extension PE not flagged: %+v", r.Detections)
+	}
+}
+
+// standin mirrors testdata/*.zip content: a harmless file standing in for a
+// known malware sample, as distributed in password-protected archives.
+func standin() []byte {
+	return bytes.Repeat([]byte("FileGate harmless stand-in for a known malware sample. Do not flag by content.\n"), 20)
+}
+
+func withStandinSignature(t *testing.T) *config.Config {
+	t.Helper()
+	cfg := testConfig(t)
+	sum := sha256.Sum256(standin())
+	os.MkdirAll(CustomSigDir(cfg), 0o755)
+	os.WriteFile(filepath.Join(CustomSigDir(cfg), "t.txt"), []byte(hex.EncodeToString(sum[:])+" Standin.KnownSample\n"), 0o644)
+	return cfg
+}
+
+func TestEncryptedSampleArchives(t *testing.T) {
+	s := newScanner(t, withStandinSignature(t))
+	// Fixtures were produced by independent tools: pyzipper (WinZip AES)
+	// and Info-ZIP `zip -P` (ZipCrypto).
+	cases := []struct{ file, password string }{
+		{"aes256-infected-deflate.zip", "infected"},
+		{"aes128-malware-stored.zip", "malware"},
+		{"zipcrypto-infected.zip", "infected"},
+		{"zipcrypto-virus-stored.zip", "virus"},
+		{"aes256-unknownpw.zip", "s3cret-Pw!"},
+		{"zipcrypto-unknownpw.zip", "hunter2"},
+	}
+	for _, c := range cases {
+		t.Run(c.file, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("testdata", c.file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Correct password: the member is decrypted and matched.
+			r := s.ScanBytesWith(context.Background(), c.file, data, Options{Password: c.password})
+			if !r.Malicious() || r.Detections[0].Name != "Standin.KnownSample" {
+				t.Fatalf("with password: %+v", r)
+			}
+			// No password, or a wrong one: never guessed, never "safe".
+			for _, pw := range []string{"", "wrong-password"} {
+				r := s.ScanBytesWith(context.Background(), c.file, data, Options{Password: pw})
+				if r.Verdict != VerdictError || r.Error != archive.ErrPasswordProtected {
+					t.Fatalf("password %q: verdict %s error %q", pw, r.Verdict, r.Error)
+				}
+			}
+		})
+	}
+	// Common sample passwords are not tried automatically.
+	data, _ := os.ReadFile(filepath.Join("testdata", "zipcrypto-infected.zip"))
+	if r := s.ScanBytes(context.Background(), "z.zip", data); r.Verdict != VerdictError {
+		t.Fatalf("no-password scan guessed the password: %+v", r)
+	}
+}
+
+func TestMD5Signature(t *testing.T) {
+	cfg := testConfig(t)
+	sample := []byte("sample only known by MD5 (e.g. VirusShare)")
+	writeDB(t, DeltaPath(cfg), func(b *sigdb.Builder) { b.AddMD5(md5.Sum(sample), "virusshare") })
+	s := newScanner(t, cfg)
+	r := s.ScanBytes(context.Background(), "x.bin", sample)
+	if !r.Malicious() || r.Detections[0].Name != "Malware.MD5.virusshare" {
+		t.Fatalf("MD5 signature not matched: %+v", r)
+	}
+	// An MD5 allowlist entry must NOT override (MD5 collisions are practical).
+	os.MkdirAll(AllowlistDir(cfg), 0o755)
+	m := md5.Sum(sample)
+	os.WriteFile(filepath.Join(AllowlistDir(cfg), "a.txt"), []byte(hex.EncodeToString(m[:])+"\n"), 0o644)
+	s.Reload()
+	if r := s.ScanBytes(context.Background(), "x.bin", sample); !r.Malicious() {
+		t.Fatalf("MD5 allowlist entry was honoured: %+v", r)
+	}
+}
+
+func TestNoSignatureDBIsError(t *testing.T) {
+	cfg := config.Default(t.TempDir())
+	cfg.ClamAV.Enabled = "off"
+	s := newScanner(t, cfg)
+	if s.Ready() == nil {
+		t.Fatal("Ready() should fail without a signature database")
+	}
+	if r := s.ScanBytes(context.Background(), "a.txt", []byte("hello")); r.Verdict != VerdictError {
+		t.Fatalf("scan without DB = %s, want error", r.Verdict)
+	}
+	// A positive detection is still reported.
+	if r := s.ScanBytes(context.Background(), "e.com", eicar()); r.Verdict != VerdictMalicious {
+		t.Fatalf("EICAR without DB = %s, want malicious", r.Verdict)
+	}
+}
+
+func TestUnsupportedContainerIsError(t *testing.T) {
+	s := newScanner(t, testConfig(t))
+	sevenZip := append([]byte{'7', 'z', 0xBC, 0xAF, 0x27, 0x1C}, make([]byte, 64)...)
+	if r := s.ScanBytes(context.Background(), "samples.7z", sevenZip); r.Verdict != VerdictError {
+		t.Fatalf("7z without ClamAV = %s, want error", r.Verdict)
+	}
+	// Nested inside a zip too.
+	if r := s.ScanBytes(context.Background(), "x.zip", mkzip(t, map[string][]byte{"in.7z": sevenZip})); r.Verdict != VerdictError {
+		t.Fatalf("nested 7z = %s, want error", r.Verdict)
+	}
+}
+
+func TestEncryptedOfficeIsError(t *testing.T) {
+	s := newScanner(t, testConfig(t))
+	doc := []byte{0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1}
+	doc = append(doc, make([]byte, 100)...)
+	for _, r := range "EncryptedPackage" {
+		doc = append(doc, byte(r), 0)
+	}
+	if r := s.ScanBytes(context.Background(), "invoice.docx", doc); r.Verdict != VerdictError {
+		t.Fatalf("encrypted Office doc = %s, want error", r.Verdict)
+	}
+}
+
+func TestUnscannablePolicyMalicious(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Policy.Unscannable = "malicious"
+	s := newScanner(t, cfg)
+	data, _ := os.ReadFile(filepath.Join("testdata", "aes256-unknownpw.zip"))
+	if r := s.ScanBytes(context.Background(), "x.zip", data); r.Verdict != VerdictMalicious {
+		t.Fatalf("policy=malicious gave %s", r.Verdict)
+	}
+}
+
+func TestTruncatedMemberIsError(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Limits.MaxFileSize = 1024
+	s := newScanner(t, cfg)
+	// Incompressible data larger than the per-object limit: not a bomb, but
+	// not fully inspected either (padding would otherwise hide a payload).
+	big := make([]byte, 8192)
+	for i := range big {
+		big[i] = byte(i*7919 + i>>3)
+	}
+	var b bytes.Buffer
+	zw := zip.NewWriter(&b)
+	w, _ := zw.CreateHeader(&zip.FileHeader{Name: "big.bin", Method: zip.Store})
+	w.Write(big)
+	zw.Close()
+	if r := s.ScanBytes(context.Background(), "pad.zip", b.Bytes()); r.Verdict != VerdictError {
+		t.Fatalf("truncated member = %s, want error", r.Verdict)
 	}
 }
